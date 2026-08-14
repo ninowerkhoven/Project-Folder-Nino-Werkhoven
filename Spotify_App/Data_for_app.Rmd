@@ -1,0 +1,264 @@
+
+---
+title: Spotify Popularity Analysis
+author: Data Science Team
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+set.seed(123) 
+```
+
+
+
+```{r}
+library(tidyverse)
+library(glmnet)
+library(fastDummies)
+library(caret)
+
+# This is the precomputed data for predicting popularity, we are going to do an elastic net model,
+# combined with a grid search to find the best alpha and lambda values. The grid search allows us to make a 
+# MSE heatmap and remove the load of having a dynamic prediction model.
+# We precompute everything because fitting hundreds of models in real time would be way too slow for a web app.
+
+# Function to prepare data with top genres and artists
+# We make this a function because we need to test many different combinations of genre/artist limits
+# and we don't want to repeat the same data preparation code over and over
+prepare_data <- function(top_n_genres, top_n_artists) {
+  
+  spotify <- read_csv("Spotify-2000.csv") %>%
+    # Remove Index and Title because they don't predict popularity and would just add noise
+    select(-Index, -Title) %>%
+    # Log transformations for skewed variables - this is crucial because
+    # Duration, Speechiness, and Liveness are heavily right-skewed, which can hurt model performance
+    # Taking the log makes them more normally distributed, which works better with linear models
+    mutate(
+      `Log Duration`    = log(`Length (Duration)` + 1),  # +1 to avoid log(0) issues
+      `Log Speechiness` = log(Speechiness + 1),
+      `Log Liveness`    = log(Liveness + 1),
+      # Create decade groups to capture temporal trends in music popularity
+      # Different decades have different musical styles and popularity patterns
+      decade_group = case_when(
+        Year >= 1956 & Year <= 1969 ~ "Y1",
+        Year >= 1970 & Year <= 1979 ~ "Y2",
+        Year >= 1980 & Year <= 1989 ~ "Y3",
+        Year >= 1990 & Year <= 1999 ~ "Y4",
+        Year >= 2000 & Year <= 2009 ~ "Y5",
+        Year >= 2010 & Year <= 2014 ~ "Y6",
+        Year >= 2015 & Year <= 2019 ~ "Y7"
+      )
+    ) %>%
+    # Create decade dummy variables with fast dummies so it is compatible with glmnet
+    # We use fastDummies instead of model.matrix because it gives us more control
+    # and doesn't automatically drop levels like model.matrix sometimes does
+    fastDummies::dummy_cols(select_columns = "decade_group", remove_first_dummy = TRUE) %>%
+    # Drop original variables that we've transformed or encoded
+    # We keep the log versions and dummy versions, but remove the originals to avoid redundancy
+    select(-c(Liveness, Speechiness, `Length (Duration)`, Year, decade_group))
+  
+  # Keep only top genres and artists to reduce dimensionality and focus on most important categories
+  # This is important because having too many rare categories can lead to overfitting
+  # and makes the model harder to interpret
+  top_genres  <- spotify %>% count(`Top Genre`, sort = TRUE) %>% slice_head(n = top_n_genres) %>% pull(`Top Genre`)
+  top_artists <- spotify %>% count(Artist, sort = TRUE) %>% slice_head(n = top_n_artists) %>% pull(Artist)
+  
+  # Replace rare genres/artists with "Other" to reduce the number of categories
+  # This prevents the model from overfitting to artists/genres that only appear a few times
+  spotify <- spotify %>%
+    mutate(
+      `Top Genre` = if_else(`Top Genre` %in% top_genres, `Top Genre`, "Other"),
+      Artist      = if_else(Artist      %in% top_artists, Artist,      "Other")
+    )
+  
+  # Clean column names to make them R-friendly and glmnet-compatible
+  names(spotify) <- make.names(names(spotify))
+  
+  # Scale numeric variables
+  # Scaling is important for regularized models like elastic net because
+  # variables with larger scales would otherwise dominate the penalty terms
+  # we don't scale the target variable popularity or dummy variables which are already 0/1
+  numeric_cols <- sapply(spotify, is.numeric)
+  dummy_cols <- grepl("decade_group_", names(spotify))
+  cols_to_scale <- numeric_cols & !dummy_cols & names(spotify) != "Popularity"
+  
+  spotify_scaled <- spotify
+  # We use scale function which,puts all numeric variables on the same scale, making regularization fair
+  spotify_scaled[cols_to_scale] <- scale(spotify[cols_to_scale])
+  
+  return(spotify_scaled)
+}
+
+# Function to run elastic net with best alpha for given data
+# We make this a function because we need to run the same model fitting process
+# for every combination of genre/artist in our grid search
+run_elastic_net <- function(spotify_data) {
+  
+  # We build the formula to include all variables except Popularity
+  model_formula <- as.formula(paste("Popularity ~", paste(names(spotify_data)[-which(names(spotify_data) == "Popularity")], collapse = " + ")))
+  # model.matrix converts factors to dummy variables
+  model_matrix <- model.matrix(model_formula, data = spotify_data)[, -1]
+  
+  # We use 70% for training and 30% for testing
+  set.seed(123)
+  trainIndex <- createDataPartition(spotify_data$Popularity, p = 0.7, list = FALSE)
+  X_train <- model_matrix[trainIndex, ]
+  y_train <- spotify_data$Popularity[trainIndex]
+  X_test <- model_matrix[-trainIndex, ]
+  y_test <- spotify_data$Popularity[-trainIndex]
+  
+  # Test different alpha values to find the best one
+  # We test 5 values to balance computational cost with finding a good alpha
+  alphas <- c(0, 0.25, 0.5, 0.75, 1)  # Just 5 alpha values for speed
+  rmse_values <- numeric(length(alphas))
+  
+  # For each alpha, we do cross validation to find the best lambda
+  # Then we test that model on our holdout test set to get an unbiased RMSE
+  set.seed(123)
+  for(i in 1:length(alphas)) {
+    cv_model <- cv.glmnet(X_train, y_train, alpha = alphas[i])
+    predictions <- predict(cv_model, s = cv_model$lambda.min, newx = X_test)
+    rmse_values[i] <- sqrt(mean((predictions - y_test)^2))
+  }
+  
+  # Find best alpha and train final model
+  # We pick the alpha that gave us the lowest RMSE on the test set, because we want an accurate prediction
+  # of popularity, and mse is a good measure of prediction error
+  best_alpha_idx <- which.min(rmse_values)
+  best_alpha <- alphas[best_alpha_idx]
+  best_rmse <- rmse_values[best_alpha_idx]
+  
+  # Calculate R-squared for best model
+  cv_model_best <- cv.glmnet(X_train, y_train, alpha = best_alpha)
+  predictions_best <- predict(cv_model_best, s = cv_model_best$lambda.min, newx = X_test)
+  SSE <- sum((predictions_best - y_test)^2)
+  SST <- sum((y_test - mean(y_test))^2)
+  r_squared <- 1 - (SSE / SST)
+  
+  # Count variables selected
+  coeffs <- coef(cv_model_best, s = cv_model_best$lambda.min)
+  num_vars_selected <- sum(coeffs[,1] != 0) - 1
+  
+  #use return list to return multiple values
+  return(list(
+    best_alpha = best_alpha,
+    best_lambda = cv_model_best$lambda.min,
+    best_rmse = best_rmse,
+    r_squared = r_squared,
+    num_vars_selected = num_vars_selected,
+    total_vars = ncol(model_matrix),
+    num_genres = length(unique(spotify_data$Top.Genre)),
+    num_artists = length(unique(spotify_data$Artist)),
+    coefficients = coeffs,  
+    cv_model = cv_model_best
+  ))
+}
+
+# We test fewer combinations to keep computation time short
+genre_thresholds <- c(1, 5, 10, 15, 20)  
+artist_thresholds <- c(1, 3, 6, 9, 12, 15)
+
+# Making a list to store results for our R shiny app
+results_list <- list()
+coefficients_storage <- list()  
+counter <- 1
+
+# Print progress information so we know the model is runnig
+cat("Starting grid search...\n")
+cat("Testing", length(genre_thresholds), "genre limits x", length(artist_thresholds), "artist limits =", 
+    length(genre_thresholds) * length(artist_thresholds), "combinations\n\n")
+
+#grid search over genre and artist limits
+for(g in genre_thresholds) {
+  for(a in artist_thresholds) {
+    
+    # Print progress so we can see how long this is taking
+    cat("Testing: Top", g, "genres, Top", a, "artists\n")
+    
+    spotify_data <- prepare_data(g, a)
+    
+    # Run elastic net with this data configuration
+    result <- run_elastic_net(spotify_data)
+    
+    # Store coefficients with a unique key, so it can be accessed later
+    combo_key <- paste0("G", g, "_A", a)
+    coefficients_storage[[combo_key]] <- result$coefficients
+    
+    # Storing the results in a structured format
+    results_list[[counter]] <- data.frame(
+      Genre_Limit = g,
+      Artist_Limit = a,
+      Best_Alpha = round(result$best_alpha, 3),
+      Best_Lambda = round(result$best_lambda, 6), 
+      RMSE = round(result$best_rmse, 4),
+      R_Squared = round(result$r_squared, 4),
+      Vars_Selected = result$num_vars_selected,
+      Total_Vars = result$total_vars,
+      Num_Genres = result$num_genres,
+      Num_Artists = result$num_artists,
+      Combo_Key = combo_key
+    )
+    
+    counter <- counter + 1
+  }
+}
+
+# Combineing all results into a single data frame
+final_results <- do.call(rbind, results_list)
+
+#filtering for lowest mse and R2
+best_rmse_idx <- which.min(final_results$RMSE)
+best_r2_idx <- which.max(final_results$R_Squared)
+
+# Print summary
+# We use cat() instead of print() for a nicer look at the data
+cat("\n" %>% rep(3) %>% paste(collapse = ""))  # Print 3 blank lines
+cat("=== GRID SEARCH COMPLETE ===\n")
+cat("Total combinations tested:", nrow(final_results), "\n\n")
+
+cat("=== BEST RMSE ===\n")
+cat("Top", final_results$Genre_Limit[best_rmse_idx], "genres, Top", final_results$Artist_Limit[best_rmse_idx], "artists\n")
+cat("RMSE:", final_results$RMSE[best_rmse_idx], "\n")
+cat("R-squared:", final_results$R_Squared[best_rmse_idx], "\n")
+cat("Alpha:", final_results$Best_Alpha[best_rmse_idx], "\n")
+cat("Variables selected:", final_results$Vars_Selected[best_rmse_idx], "out of", final_results$Total_Vars[best_rmse_idx], "\n\n")
+
+cat("=== BEST R-SQUARED ===\n")
+cat("Top", final_results$Genre_Limit[best_r2_idx], "genres, Top", final_results$Artist_Limit[best_r2_idx], "artists\n")
+cat("RMSE:", final_results$RMSE[best_r2_idx], "\n")
+cat("R-squared:", final_results$R_Squared[best_r2_idx], "\n")
+cat("Alpha:", final_results$Best_Alpha[best_r2_idx], "\n")
+cat("Variables selected:", final_results$Vars_Selected[best_r2_idx], "out of", final_results$Total_Vars[best_r2_idx], "\n\n")
+
+#Shows us everything of the best configuration
+best_combo_key <- final_results$Combo_Key[best_rmse_idx]
+best_coeffs <- coefficients_storage[[best_combo_key]]
+# Only show non-zero coefficients
+nonzero_coeffs <- best_coeffs[best_coeffs[,1] != 0, , drop = FALSE]
+
+cat("\n=== COEFFICIENTS FOR BEST MODEL ===\n")
+cat("Combination:", best_combo_key, "\n")
+print(nonzero_coeffs)
+
+save(final_results, coefficients_storage, file = "grid_search_results.RData")
+write_csv(final_results, "grid_search_results.csv")
+cat("\nResults saved to 'grid_search_results.RData' and 'grid_search_results.csv'\n")
+
+# Display the full results dataframe for reference
+# This shows all combinations and their performance, useful for creating heatmaps
+cat("\n=== ALL RESULTS ===\n")
+print(final_results)
+```
+
