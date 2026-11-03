@@ -1,0 +1,2643 @@
+---
+title: "3.6 Flight Cancellation Prediction"
+author: ""
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: default
+---
+
+
+## 3.6.1 Introduction: Economic Framework for Insurance Recommendations
+
+### Motivation
+Flight cancellations represent one of the most disruptive outcomes in air travel. While delays create inconvenience, cancellations force complete rebooking and often result in missed connections or events. The ability to predict cancellation risk at booking time enables airlines to offer targeted insurance products that are both economically justified and valuable to customers.
+
+### The Economic Decision Rule
+This analysis develops a cancellation prediction model with a specific business application: **insurance recommendations at booking time**. The key insight is that insurance should only be recommended when it is economically justified—that is, when the expected value for the customer is non-negative.
+
+**Break-Even Threshold:**
+- Assume insurance costs approximately **6.5% of ticket price**
+- Insurance provides **full reimbursement** if flight is cancelled
+- Break-even occurs when **cancellation probability ≥ 6.5%**
+- This corresponds to roughly the **top 3% of flights** by predicted risk
+
+**Decision Framework:**
+- **Below break-even:** Expected value is negative → **Do not recommend insurance**
+- **Above break-even:** Expected value is non-negative → **Recommend insurance with strength based on both risk tier and fare**
+
+### Methodological Approach
+The analysis proceeds in two phases:
+
+1. **Live Weather Model:** Establish baseline performance using day-of-flight weather data and optimize hyperparameters with proper temporal cross-validation
+2. **Booking-Time Model:** Replace live weather with monthly historical averages for realistic booking-time prediction, then optimize hyperparameters via Bayesian optimization and evaluate economic thresholds across 12 risk tiers
+
+This framework ensures that insurance recommendations are economically sound, transparent to customers, and operationally practical for airlines.
+
+```{r install-packages, eval=FALSE}
+install.packages(c(
+  "arrow", "dplyr", "xgboost", "pROC", "caret", "lubridate",
+  "zoo", "ggplot2", "tidyr", "knitr", "stringr", "purrr",
+  "tibble", "kableExtra", "rBayesianOptimization"
+))
+```
+
+## 3.6.2 Data Preparation & Three-Approach Comparison
+
+This section walks through how the cancellation prediction models are built and compared in code.
+
+It starts by defining the set of booking-time features that will be used as inputs. These include time variables, airline and route information, flight characteristics, fares, and weather at both origin and destination. Since some of these are categorical (like airline or airport), the encode_and_clean function converts them into numeric form and replaces missing values with a fixed placeholder so the model can handle them.
+
+The full dataset is then loaded, including cancelled flights, and some basic statistics are printed to show how many flights are cancelled versus completed. After that, the data is split into a training set (all years except 2019) and a test set (2019). From these, two clean datasets are created that contain only the selected features and the target variable Cancelled.
+
+Before training, the code checks the class imbalance by counting how many cancelled and non-cancelled flights are in the training set. This is important because cancellations are very rare, which influences how the models are set up.
+
+Three separate training functions are then defined. Each one builds an XGBoost model with the same base settings but a different approach to handling imbalance. The baseline model uses standard parameters. The calibrated model adds max_delta_step to stabilize updates during training. The ranking model instead uses scale_pos_weight, calculated from the imbalance ratio, to give more importance to cancelled flights and optimize for AUC.
+
+All three models are trained using the same structure: the data is converted into XGBoost’s matrix format, the model is trained with early stopping, and performance is monitored on the test set.
+
+Finally, the evaluate_cancel function generates predictions for each model and computes evaluation metrics. It calculates AUC using ROC curves, determines an optimal classification threshold, builds a confusion matrix, and derives metrics like precision, recall, specificity, and F1-score. The results from all three approaches are then combined into a single table so they can be compared side by side.
+```{r}
+library(arrow)
+library(dplyr)
+library(xgboost)
+library(pROC)
+library(caret)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(kableExtra)
+library(rBayesianOptimization)
+library(patchwork)
+
+set.seed(42)
+
+# Configuration ================================================================
+
+# Define booking features
+booking_features <- c(
+  "Year", "Quarter", "Month", "DayofMonth", "DayOfWeek",
+  "CRSDepTime", "CRSElapsedTime", 
+  "Reporting_Airline", "Origin", "Dest", 
+  "Distance", "OriginWac", "DestWac", "avg_fare",
+  "origin_TEMP", "origin_DEWP", "origin_VISIB", "origin_WDSP", "origin_MXSPD", 
+  "origin_MAX", "origin_MIN", "origin_PRCP", "origin_SNDP",
+  "dest_TEMP", "dest_DEWP", "dest_VISIB", "dest_WDSP", "dest_MXSPD",
+  "dest_MAX", "dest_MIN", "dest_PRCP", "dest_SNDP"
+)
+
+# Load original data
+df_full <- read_parquet("merged_weather_final.parquet")
+
+# Save WAC mapping BEFORE encoding!
+origin_wac_map_original <- df_full %>% 
+  select(Origin, OriginWac) %>% 
+  distinct()
+
+dest_wac_map_original <- df_full %>% 
+  select(Dest, DestWac) %>% 
+  distinct()
+
+# Get unique levels from full dataset
+airline_levels <- df_full %>% pull(Reporting_Airline) %>% unique() %>% sort()
+origin_levels <- df_full %>% pull(Origin) %>% unique() %>% sort()
+dest_levels <- df_full %>% pull(Dest) %>% unique() %>% sort()
+
+# Encode using consistent factor levels
+df_full <- df_full %>%
+  mutate(
+    Reporting_Airline = as.integer(factor(Reporting_Airline, levels = airline_levels)),
+    Origin = as.integer(factor(Origin, levels = origin_levels)),
+    Dest = as.integer(factor(Dest, levels = dest_levels))
+  )
+
+# Create encoded WAC maps (integer Origin/Dest → WAC)
+origin_wac_map <- tibble(
+  Origin_char = origin_levels,
+  Origin = as.integer(factor(origin_levels, levels = origin_levels))
+) %>%
+  left_join(origin_wac_map_original, by = c("Origin_char" = "Origin")) %>%
+  select(Origin, OriginWac)
+
+dest_wac_map <- tibble(
+  Dest_char = dest_levels,
+  Dest = as.integer(factor(dest_levels, levels = dest_levels))
+) %>%
+  left_join(dest_wac_map_original, by = c("Dest_char" = "Dest")) %>%
+  select(Dest, DestWac)
+
+# Save encoding maps for production use
+encoding_map <- list(
+  airlines = set_names(seq_along(airline_levels), airline_levels),
+  origins = set_names(seq_along(origin_levels), origin_levels),
+  destinations = set_names(seq_along(dest_levels), dest_levels),
+  origin_wac = origin_wac_map,
+  dest_wac = dest_wac_map
+)
+
+```
+DATA LOADING & ENCODING
+════════════════════════════════════════════════════════════
+
+Dataset statistics:
+  Total flights:      635,311 
+  Cancelled:          10,456 (1.65%)
+  Operated:           624,855 (98.35%)
+
+```{r}
+# Train/Test Split =============================================================
+
+train_full <- df_full %>% filter(Year != 2019)
+test_full <- df_full %>% filter(Year == 2019)
+
+# Prepare cancellation datasets
+cancel_train <- train_full %>% 
+  select(all_of(c(booking_features, "Cancelled"))) %>%
+  select(where(~ !is.character(.)))
+
+cancel_test <- test_full %>% 
+  select(all_of(c(booking_features, "Cancelled"))) %>%
+  select(where(~ !is.character(.)))
+
+# Calculate class imbalance
+class_stats <- cancel_train %>%
+  summarise(
+    neg = sum(Cancelled == 0),
+    pos = sum(Cancelled == 1),
+    ratio = neg / pos
+  )
+```
+Train/test split:
+  Train (2010-2018): 559,075 
+  Test (2019):       76,236 
+
+Cancellation dataset split:
+  Train: 559,075 flights, 9,061 cancelled
+  Test:  76,236 flights, 1,395 cancelled
+
+Class imbalance:  60.7:1 (severely imbalanced)
+
+```{r cancellation-data-and-models, cache=TRUE}
+
+# Model Training Functions =====================================================
+
+# Helper function to create DMatrix
+create_dmatrix <- function(data, label_col) {
+  features <- data %>% select(-all_of(label_col)) %>% as.matrix()
+  labels <- data %>% pull(!!label_col)
+  xgb.DMatrix(data = features, label = labels)
+}
+
+# Baseline model
+train_cancel_baseline <- function() {
+  dtrain <- create_dmatrix(cancel_train, "Cancelled")
+  dtest <- create_dmatrix(cancel_test, "Cancelled")
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.05,
+    max_depth = 4,
+    min_child_weight = 5,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 200,
+    watchlist = list(test = dtest),
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+  
+  list(model = model, dtest = dtest)
+}
+
+# Calibrated model
+train_cancel_calibrated <- function() {
+  dtrain <- create_dmatrix(cancel_train, "Cancelled")
+  dtest <- create_dmatrix(cancel_test, "Cancelled")
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.05,
+    max_depth = 4,
+    min_child_weight = 5,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    max_delta_step = 1
+  )
+  
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 200,
+    watchlist = list(test = dtest),
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+  
+  list(model = model, dtest = dtest)
+}
+
+# Ranking model
+train_cancel_ranking <- function() {
+  dtrain <- create_dmatrix(cancel_train, "Cancelled")
+  dtest <- create_dmatrix(cancel_test, "Cancelled")
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = 0.05,
+    max_depth = 4,
+    min_child_weight = 5,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    scale_pos_weight = class_stats$ratio
+  )
+  
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 200,
+    watchlist = list(test = dtest),
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+  
+  list(model = model, dtest = dtest)
+}
+
+# Train All Models =============================================================
+set.seed(42)
+cancel_baseline <- train_cancel_baseline()
+cancel_calib <- train_cancel_calibrated()
+cancel_rank <- train_cancel_ranking()
+
+# Evaluation Function ==========================================================
+
+evaluate_cancel <- function(model_result, approach_name) {
+  # Make predictions
+  preds <- predict(model_result$model, model_result$dtest)
+  
+  # ROC analysis
+  roc_obj <- roc(cancel_test$Cancelled, preds, quiet = TRUE)
+  optimal_threshold <- coords(roc_obj, "best")$threshold
+  
+  # Predicted classes
+  pred_class <- ifelse(preds > optimal_threshold, 1, 0) %>% factor()
+  true_class <- cancel_test$Cancelled %>% factor()
+  
+  # Confusion matrix
+  cm <- confusionMatrix(pred_class, true_class, positive = "1")
+  
+  # Calculate F1 Score
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  
+  # Return results as tibble
+  tibble(
+    Approach = approach_name,
+    AUC = round(auc(roc_obj), 4),
+    Kappa = round(cm$overall["Kappa"], 3),
+    Precision = sprintf("%.1f%%", precision * 100),
+    Recall = sprintf("%.1f%%", recall * 100),
+    Specificity = sprintf("%.1f%%", cm$byClass["Specificity"] * 100),
+    `F1-Score` = round(f1, 3)
+  )
+}
+
+# Evaluate all models
+results <- bind_rows(
+  evaluate_cancel(cancel_baseline, "Baseline"),
+  evaluate_cancel(cancel_calib, "Calibrated"),
+  evaluate_cancel(cancel_rank, "Ranking")
+)
+
+# Display as kable
+results %>%
+  kable(align = c("l", rep("r", 6))) %>%
+  kable_styling()
+```
+
+All three models perform similarly, with AUC values around 0.78, indicating good ability to rank cancelled flights above non-cancelled ones. This suggests that the choice of imbalance handling method has only a limited impact on overall ranking performance for this severely imbalanced problem (60.7:1 ratio).
+The differences become more apparent when examining the balance between precision and recall. The baseline model achieves the highest recall (61.5%), meaning it captures more cancellations, but at the cost of very low precision (6.0%), resulting in a large number of false positives. The ranking approach, which incorporates class weighting via scale_pos_weight, produces a slightly more balanced trade-off with improved precision (5.7%) and comparable recall (63.9%), though the overall improvement is modest.
+The calibration model (using max_delta_step) shows intermediate performance, achieving 5.3% precision and 65.1% recall. While it provides a different precision-recall trade-off, it does not clearly outperform the other approaches.
+Selected Approach: Given the nearly identical AUC performance across all three methods (0.7780–0.7822), we select the ranking approach (scale_pos_weight) as our final model. This method optimizes directly for AUC via eval_metric = "auc", aligns with the insurance application's focus on risk ranking rather than binary classification, and provides a principled approach to addressing class imbalance through appropriate weighting of the minority class.
+Despite these differences, precision remains low across all models (5–6%) due to the severe class imbalance (1.65% cancellation rate), highlighting the inherent difficulty of predicting rare cancellation events. However, the strong AUC (~0.78) indicates that the model successfully ranks high-risk flights, which is the critical requirement for insurance recommendations.
+
+
+## 3.6.3 Feature Importance & Performance
+```{r cancellation-final, fig.height=5, fig.cap="Top 15 Most Important Features for Cancellation Prediction"}
+# Extract model and recreate DMatrix for predictions
+model_cancel <- cancel_rank$model
+
+# Recreate DMatrix
+dtest_cancel <- xgb.DMatrix(
+  data = as.matrix(cancel_test %>% select(-Cancelled)),
+  label = cancel_test$Cancelled
+)
+
+cancel_preds <- predict(model_cancel, dtest_cancel)
+
+# ROC analysis
+roc_cancel <- pROC::roc(
+  cancel_test$Cancelled, 
+  cancel_preds, 
+  quiet = TRUE
+)
+
+optimal_threshold <- coords(roc_cancel, "best")$threshold
+
+# Confusion matrix
+cm_cancel <- confusionMatrix(
+  factor(ifelse(cancel_preds > optimal_threshold, 1, 0)),
+  factor(cancel_test$Cancelled), 
+  positive = "1"
+)
+
+# Create performance metrics table
+performance_metrics <- tibble(
+  Metric = c("AUC", "Kappa", "Precision", "Recall"),
+  Value = c(
+    round(pROC::auc(roc_cancel), 4),
+    round(cm_cancel$overall["Kappa"], 3),
+    sprintf("%.1f%%", cm_cancel$byClass["Pos Pred Value"] * 100),
+    sprintf("%.1f%%", cm_cancel$byClass["Sensitivity"] * 100)
+  )
+)
+
+kable(
+  performance_metrics,
+  caption = "Final Cancellation Model Performance",
+  align = c("l", "r")
+)
+
+# Get feature importance
+imp_cancel <- xgb.importance(model = model_cancel) %>%
+  as_tibble()
+
+# Calculate weather feature importance
+weather_pattern <- "TEMP|DEWP|VISIB|WDSP|MXSPD|MAX|MIN|PRCP|SNDP"
+weather_gain <- imp_cancel %>%
+  filter(str_detect(Feature, weather_pattern)) %>%
+  summarise(total_gain = sum(Gain)) %>%
+  pull(total_gain)
+
+# Feature importance plot
+imp_cancel %>%
+  head(15) %>%
+  mutate(Feature = reorder(Feature, Gain)) %>%
+  ggplot(aes(x = Gain, y = Feature)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(
+    title = "Top 15 Features for Cancellation Prediction",
+    x = "Gain",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+The final cancellation model (ranking approach with scale_pos_weight) achieves an AUC of 0.7822, demonstrating strong ability to rank flights by cancellation risk. This model correctly identifies 63.8% of cancelled flights (recall), though precision remains low at 5.7% due to the severe class imbalance (1.65% cancellation rate, 60.7:1 ratio).
+Why the Ranking Approach? We selected the scale_pos_weight method because it optimizes directly for AUC through the eval_metric = "auc" setting, making it ideal for risk ranking applications rather than binary classification. For insurance recommendations, the critical capability is correctly ordering flights from highest to lowest cancellation risk—not achieving high precision on every individual prediction. The strong AUC of 0.78 confirms the model successfully performs this ranking task.
+Feature Importance Analysis reveals that cancellations are predominantly weather-driven. Weather features collectively account for 67.3% of the model's predictive power (compared to ~30% for delay models), with visibility at both origin and destination being the two most important individual features. The top weather predictors include:
+
+origin_VISIB (0.15 importance) – Poor visibility at departure airport
+dest_VISIB (0.11 importance) – Poor visibility at arrival airport
+origin_MXSPD & dest_MXSPD – High wind speeds
+origin_DEWP, dest_DEWP, origin_TEMP, dest_TEMP – Temperature and humidity patterns
+
+This weather dominance distinguishes cancellations from delays, where operational factors (CRSDepTime) are more important. Reporting_Airline ranks 3rd overall (0.07 importance), indicating airline-specific cancellation policies and operational resilience also play a role, though secondary to weather conditions.
+Practical Application: This model functions best as a risk indicator rather than a definitive predictor. It excels at identifying the highest-risk flights for targeted insurance recommendations. For example, flights in the top 10% risk tier have historically experienced cancellations at rates far exceeding the 1.65% baseline, making insurance economically justified for these bookings. The model enables transparent, weather-informed risk communication to customers at booking time.
+
+
+
+
+---
+
+## 3.6.4 Hyperparameter Optimization with Bayesian Optimization
+
+Hyperparameters are optimized using Bayesian optimization combined with temporal cross-validation, where models are trained on past years and evaluated on subsequent years to ensure realistic performance estimates. The optimization focuses on maximizing AUC, which measures the model’s ability to rank cancelled flights above non-cancelled ones. In addition to standard parameters such as tree depth, learning rate, and subsampling, the scale_pos_weight parameter is included to account for the strong class imbalance in the data. According to the official XGBoost documentation, scale_pos_weight is particularly important when optimizing for AUC, as it adjusts the relative importance of the minority class and improves the model’s ranking performance. The optimization procedure efficiently explores the parameter space and selects the configuration that achieves the highest average AUC across folds, providing a robust and well-tuned model for cancellation prediction.
+
+
+**Note:** The following chunk is set to `eval=FALSE` as it takes ~1 hour to run. Results are pre-computed.
+
+```{r eval=FALSE}
+# CV Fold Configuration ========================================================
+
+folds_cancel <- list(
+  list(train_years = 2010:2015, test_year = 2016),
+  list(train_years = 2010:2016, test_year = 2017),
+  list(train_years = 2010:2017, test_year = 2018),
+  list(train_years = 2010:2018, test_year = 2019)
+)
+
+# Prepare Modeling Dataset =====================================================
+
+cancel_model_data <- df_full %>%
+  select(all_of(c(booking_features, "Cancelled"))) %>%
+  select(where(~ !is.character(.)))
+
+# Calculate class imbalance
+class_stats_full <- cancel_model_data %>%
+  summarise(
+    neg = sum(Cancelled == 0),
+    pos = sum(Cancelled == 1),
+    ratio = neg / pos
+  )
+
+# CV Scoring Function ==========================================================
+
+scoring_cancel <- function(max_depth, eta, min_child_weight,
+                           subsample, colsample_bytree, scale_pos_weight) {
+  
+  fold_aucs <- map_dbl(folds_cancel, function(fold) {
+    
+    # Split by year
+    train_fold <- cancel_model_data %>% filter(Year %in% fold$train_years)
+    test_fold  <- cancel_model_data %>% filter(Year == fold$test_year)
+    
+    # Create DMatrix
+    dtrain_f <- xgb.DMatrix(
+      data  = train_fold %>% select(-Cancelled) %>% as.matrix(),
+      label = train_fold %>% pull(Cancelled)
+    )
+    
+    dtest_f <- xgb.DMatrix(
+      data  = test_fold %>% select(-Cancelled) %>% as.matrix(),
+      label = test_fold %>% pull(Cancelled)
+    )
+    
+    # Train model
+    model_f <- xgb.train(
+      params = list(
+        objective        = "binary:logistic",
+        eval_metric      = "auc",
+        tree_method      = "hist",
+        max_depth        = as.integer(max_depth),
+        eta              = eta,
+        min_child_weight = min_child_weight,
+        subsample        = subsample,
+        colsample_bytree = colsample_bytree,
+        scale_pos_weight = scale_pos_weight
+      ),
+      data                  = dtrain_f,
+      nrounds               = 300,
+      evals                 = list(test = dtest_f),
+      early_stopping_rounds = 30,
+      verbose               = 0
+    )
+    
+    # Calculate AUC
+    preds <- predict(model_f, dtest_f)
+    roc(test_fold$Cancelled, preds, quiet = TRUE) %>% auc() %>% as.numeric()
+  })
+  
+  list(Score = mean(fold_aucs), Pred = 0)
+}
+
+# Hyperparameter Search Space ==================================================
+
+bounds_cancel <- list(
+  max_depth        = c(4L, 8L),
+  eta              = c(0.01, 0.15),
+  min_child_weight = c(1L, 15L),
+  subsample        = c(0.5, 1.0),
+  colsample_bytree = c(0.5, 0.8),
+  scale_pos_weight = c(1, class_stats_full$ratio)
+)
+
+# Bayesian Optimization ========================================================
+
+set.seed(42)
+
+bayes_cancel <- rBayesianOptimization::BayesianOptimization(
+  FUN         = scoring_cancel,
+  bounds      = bounds_cancel,
+  init_points = 5,
+  n_iter      = 20,
+  acq         = "ucb",
+  verbose     = TRUE
+)
+
+# Best Parameters
+bayes_cancel$Best_Par
+bayes_cancel$Best_Value
+
+# Optimization Progress Plot ===================================================
+
+bayes_cancel$History %>%
+  mutate(
+    Iteration = row_number(),
+    Best_AUC  = cummax(Value)
+  ) %>%
+  ggplot(aes(x = Iteration)) +
+  geom_line(aes(y = Best_AUC), linewidth = 0.8) +
+  geom_point(aes(y = Value), alpha = 0.6) +
+  labs(
+    title = "Bayesian Optimization Progress - Cancellation Model",
+    x = "Iteration",
+    y = "Mean CV AUC"
+  ) +
+  theme_minimal()
+```
+The Bayesian optimization identifies a moderately complex model with a higher tree depth (max_depth = 7) and a relatively low learning rate (eta ≈ 0.04), indicating a balance between capturing nonlinear relationships and maintaining stable learning. The high min_child_weight (14) and subsampling further regularize the model, reducing the risk of overfitting. The optimized scale_pos_weight (~26) reflects the class imbalance and ensures that cancellation events receive sufficient emphasis during training. The resulting mean cross-validated AUC of approximately 0.799 indicates strong ranking performance under temporal validation, although this higher value should be interpreted with caution compared to more constrained settings, as it may reflect differences in feature construction or information availability.
+
+
+```{r}
+# ════════════════════════════════════════════════════════════
+# TRAIN FINAL MODEL — LIVE WEATHER (CANCEL)
+# ════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------
+# TRAIN FINAL MODEL
+# ---------------------------------------------------------
+dtrain <- create_dmatrix(cancel_train %>% select(-Year, -any_of(c("day_of_year", "week_of_year"))), "Cancelled")
+dtest  <- create_dmatrix(cancel_test  %>% select(-Year, -any_of(c("day_of_year", "week_of_year"))), "Cancelled")
+set.seed(42)
+
+final_optimised_live_cancel_model <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 7,
+    eta = 0.0404,
+    min_child_weight = 14,
+    subsample = 0.837,
+    colsample_bytree = 0.552,
+    scale_pos_weight = 26.07
+  ),
+  data = dtrain,
+  nrounds = 300,
+  evals = list(test = dtest), # Updated from watchlist to prevent deprecation warning
+  early_stopping_rounds = 30,
+  verbose = 0
+)
+
+# ---------------------------------------------------------
+# PREDICTIONS + PERFORMANCE
+# ---------------------------------------------------------
+preds_cancel <- predict(final_optimised_live_cancel_model, dtest)
+
+roc_obj <- roc(cancel_test$Cancelled, preds_cancel, quiet = TRUE)
+test_auc_cancel <- as.numeric(auc(roc_obj))
+
+# ---------------------------------------------------------
+# SAVE FOR PRODUCTION / LATER USE
+# ---------------------------------------------------------
+xgb.save(final_optimised_live_cancel_model, "model_cancel_live.model")
+
+
+# ---------------------------------------------------------
+# INSURANCE SETTINGS
+# ---------------------------------------------------------
+premium_pct <- 6.5
+
+# ---------------------------------------------------------
+# RISK TIERS
+# ---------------------------------------------------------
+risk_percentiles <- c(0.99, 0.98, 0.95, 0.90, 0.80, 0.70, 0.60, 0.50, 
+                      0.40, 0.30, 0.20, 0.10, 0.00)
+
+risk_labels <- c("Top 1%", "Top 2%", "Top 5%", "Top 10%", "Top 20%", "Top 30%", 
+                 "Top 40%", "Top 50%", "Top 60%", "Top 70%", "Top 80%", "Top 90%", "Baseline")
+
+# ---------------------------------------------------------
+# BREAK-EVEN FINDER (6.5%)
+# ---------------------------------------------------------
+find_break_even_tier <- function(preds, actuals, target = 6.5) {
+  
+  thresholds <- quantile(preds, seq(0.50, 0.999, by = 0.001))
+  
+  rates <- sapply(thresholds, function(thresh) {
+    mean(actuals[preds >= thresh]) * 100
+  })
+  
+  idx <- which.min(abs(rates - target))
+  
+  list(
+    cancel_rate = rates[idx],
+    pct = mean(preds >= thresholds[idx]) * 100
+  )
+}
+
+be_live <- find_break_even_tier(
+  preds_cancel,
+  cancel_test$Cancelled
+)
+
+# ---------------------------------------------------------
+# COMPUTE CANCEL RATES + EXPECTED VALUE
+# ---------------------------------------------------------
+compute_cancel_thresholds <- function(preds, actuals, premium) {
+  
+  results <- list()
+  
+  for (i in seq_along(risk_percentiles)) {
+    
+    pct <- risk_percentiles[i]
+    label <- risk_labels[i]
+    
+    if (pct == 0) {
+      mask <- rep(TRUE, length(preds))
+    } else {
+      threshold <- quantile(preds, pct)
+      mask <- preds >= threshold
+    }
+    
+    tier_actuals <- actuals[mask]
+    cancel_rate <- mean(tier_actuals) * 100
+    EV <- cancel_rate - premium
+    
+    decision <- case_when(
+      abs(EV) < 0.3 ~ "BREAK-EVEN",
+      EV > 0 ~ "BUY",
+      TRUE ~ "SKIP"
+    )
+    
+    results[[i]] <- data.frame(
+      Risk = label,
+      CancelRate = cancel_rate,
+      EV = EV,
+      Decision = decision
+    )
+  }
+  
+  bind_rows(results)
+}
+
+# ---------------------------------------------------------
+# RUN ANALYSIS & BUILD DATAFRAME
+# ---------------------------------------------------------
+cancel_live_df <- compute_cancel_thresholds(
+  preds_cancel,
+  cancel_test$Cancelled,
+  premium_pct
+) %>% 
+  mutate(Model = "Live Weather")
+
+# ---------------------------------------------------------
+# ADD BREAK-EVEN ROW
+# ---------------------------------------------------------
+be_row <- data.frame(
+  Risk = "Break-even (6.5%)",
+  CancelRate = be_live$cancel_rate,
+  EV = be_live$cancel_rate - premium_pct,
+  Decision = "BREAK-EVEN",
+  Model = "Live Weather"
+
+)
+
+cancel_live_df
+```
+
+```{r}
+# Model Evaluation =============================================================
+
+# Make predictions
+preds <- predict(final_optimised_live_cancel_model, dtest)
+
+# ROC analysis
+roc_obj <- roc(cancel_test$Cancelled, preds, quiet = TRUE)
+auc(roc_obj)
+
+# Threshold Analysis ===========================================================
+
+# Define thresholds to evaluate
+thresholds <- c(
+  quantile(preds, 0.830),
+  quantile(preds, 0.90),
+  quantile(preds, 0.95),
+  quantile(preds, 0.96995),
+  quantile(preds, 0.98),
+  quantile(preds, 0.99)
+)
+
+# Evaluate each threshold
+results <- map(thresholds, function(thresh) {
+  
+  # Predicted classes
+  pred_class <- ifelse(preds > thresh, 1, 0) %>% factor()
+  true_class <- cancel_test$Cancelled %>% factor()
+  
+  # Confusion matrix
+  cm <- confusionMatrix(pred_class, true_class, positive = "1")
+  
+  # Extract metrics
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  
+  # Calculate lift
+  baseline_rate <- mean(cancel_test$Cancelled)
+  lift <- precision / baseline_rate
+  
+  # Return as tibble
+  tibble(
+    Threshold = round(thresh, 4),
+    Top_Pct = sprintf("%.1f%%", 100 * mean(preds > thresh)),
+    AUC = round(auc(roc_obj), 4),
+    Precision = sprintf("%.2f%%", precision * 100),
+    Recall = sprintf("%.1f%%", recall * 100),
+    Specificity = sprintf("%.1f%%", specificity * 100),
+    F1 = round(f1, 3),
+    Lift = sprintf("%.2fx", lift)
+  )
+})
+
+# Evaluate and display only the live weather stats
+evaluate_cancel(list(model = final_optimised_live_cancel_model, dtest = dtest), "Live Weather (Optimised)") %>%
+  kable() %>%
+  kable_styling()
+
+# Combine results
+threshold_results <- bind_rows(results)
+
+kable(threshold_results, format = "simple")
+```
+The results show a clear trade-off as the threshold becomes more strict. The model achieves an AUC of 0.7956, demonstrating strong ability to rank flights by cancellation risk. Using live weather information, precision ranges from 5.54% at broader selections (top 22%) to 25.16% for the top 1% of flights. This indicates substantial risk concentration, as reflected in the high lift values, reaching 13.75× at the most selective threshold.
+Economic Break-Even Analysis: Assuming insurance costs approximately 6.5% of ticket price and provides full reimbursement upon cancellation, the break-even threshold occurs when cancellation probability exceeds 6.5%. At the top 16.9% risk tier (6.50% precision), insurance becomes economically justified with zero expected value. At more restrictive thresholds, the expected value becomes increasingly positive:
+
+Top 10%: 8.89% cancellation rate → Expected benefit of 2.39% of ticket price
+Top 5%: 12.93% cancellation rate → Expected benefit of 6.43% of ticket price
+Top 2%: 19.28% cancellation rate → Expected benefit of 12.78% of ticket price
+Top 1%: 25.16% cancellation rate → Expected benefit of 18.66% of ticket price
+
+Risk-Based Recommendation Tiers:
+
+Top 1% (Very High Risk): 25.16% cancellation rate (3.9× break-even) → Strongly recommend insurance
+Top 2% (High Risk): 19.28% cancellation rate (3.0× break-even) → Recommend insurance
+Top 5% (Moderate Risk): 12.93% cancellation rate (2.0× break-even) → Consider insurance
+Top 10% (Above Break-Even): 8.89% cancellation rate (1.4× break-even) → Insurance economically justified
+Below Top 17%: <6.5% cancellation rate → Insurance not recommended
+
+Important Caveat: These results rely on live weather information, which would not be available at booking time. As such, while the model demonstrates strong predictive performance and risk concentration, it does not represent a realistic scenario for decision-making at the time of purchase. Instead, it serves as an upper bound on achievable performance when future information is available, highlighting the gap between real-time and booking-time prediction settings.
+
+### 3.6.5 Booking-Time Prediction with Hybrid Weather Features
+
+The Challenge: Balancing Precision and Stability
+At the time of booking, actual future weather is unknown, requiring the use of historical patterns. We must choose between weekly averages (precise but potentially noisy) or monthly averages (stable but coarse).
+
+Our analysis of the "Live Weather" model established that visibility is the dominant meteorological driver of flight cancellations. Consequently, we developed a Hybrid 7-day approach that applies 7-day smoothed averages specifically to visibility (origin and destination), while maintaining monthly averages for all other weather features. This ensures we capture the most critical predictive signal—visibility—without over-weighting secondary weather factors that are more stable over time.
+
+Sparse Airport Handling
+For airports with limited historical data, we implement a three-tier fallback hierarchy:
+
+Airport-specific averages.
+
+Regional (World Area Code) averages for geographically similar locations.
+
+Global averages as a last resort.
+
+This framework creates two comparable specifications: Pure Monthly (all features as monthly averages) and Hybrid 7-day (visibility smoothed weekly). This allows us to quantify if focusing on high-granularity visibility data improves cancellation prediction at the booking stage.
+
+```{r hybrid-three-approaches}
+# Data Preparation with Day of Year ============================================
+
+# Only use train_full (2010-2018) for weather computation
+cancel_data <- train_full %>%
+  filter(!is.na(Cancelled)) %>%
+  select(all_of(booking_features), Cancelled) %>%
+  mutate(day_of_year = yday(as.Date(paste(Year, Month, DayofMonth, sep = "-"))))
+
+# Preserve day_of_year before encoding
+day_of_year_vec <- cancel_data$day_of_year
+cancel_data <- cancel_data %>% select(where(~ !is.character(.)))
+cancel_data$day_of_year <- day_of_year_vec
+
+cancel_train <- cancel_data %>% filter(Year <= 2018)
+
+# Test set preparation
+cancel_test_raw <- test_full %>%
+  filter(!is.na(Cancelled)) %>%
+  select(all_of(booking_features), Cancelled) %>%
+  mutate(day_of_year = yday(as.Date(paste(Year, Month, DayofMonth, sep = "-"))))
+
+day_of_year_vec_test <- cancel_test_raw$day_of_year
+cancel_test_raw <- cancel_test_raw %>% select(where(~ !is.character(.)))
+cancel_test_raw$day_of_year <- day_of_year_vec_test
+
+cancel_test <- cancel_test_raw
+
+# Add week_of_year for hybrid VISIB ===========================================
+
+cancel_train <- cancel_train %>%
+  mutate(week_of_year = week(as.Date(paste(Year, Month, DayofMonth, sep = "-"))))
+
+cancel_test <- cancel_test %>%
+  mutate(week_of_year = week(as.Date(paste(Year, Month, DayofMonth, sep = "-"))))
+
+# Pure Monthly Weather Lookups =================================================
+
+# All features as monthly means (baseline)
+monthly_all_origin <- cancel_train %>%
+  group_by(Origin, Month) %>%
+  summarise(across(starts_with("origin_"), ~mean(., na.rm = TRUE)), .groups = "drop")
+
+monthly_all_dest <- cancel_train %>%
+  group_by(Dest, Month) %>%
+  summarise(across(starts_with("dest_"), ~mean(., na.rm = TRUE)), .groups = "drop")
+
+saveRDS(monthly_all_origin, "monthly_weather_origin.rds")
+saveRDS(monthly_all_dest, "monthly_weather_dest.rds")
+cat("✓ Saved monthly weather lookup tables\n")
+# Weekly VISIB Lookups =========================================================
+
+weekly_visib_origin <- cancel_train %>%
+  group_by(Origin, week_of_year) %>%
+  summarise(origin_VISIB = mean(origin_VISIB, na.rm = TRUE), .groups = "drop")
+
+weekly_visib_dest <- cancel_train %>%
+  group_by(Dest, week_of_year) %>%
+  summarise(dest_VISIB = mean(dest_VISIB, na.rm = TRUE), .groups = "drop")
+
+# Apply Weather to Train/Test Sets ============================================
+
+# 1. Pure Monthly (all means) - BASELINE
+cancel_train_monthly <- cancel_train %>%
+  left_join(monthly_all_origin, by = c("Origin", "Month"), suffix = c("", "_m")) %>%
+  left_join(monthly_all_dest, by = c("Dest", "Month"), suffix = c("", "_m")) %>%
+  mutate(
+    across(starts_with("origin_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .)),
+    across(starts_with("dest_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .))
+  ) %>%
+  select(-ends_with("_m"), -day_of_year, -week_of_year)
+
+cancel_test_monthly <- cancel_test %>%
+  left_join(monthly_all_origin, by = c("Origin", "Month"), suffix = c("", "_m")) %>%
+  left_join(monthly_all_dest, by = c("Dest", "Month"), suffix = c("", "_m")) %>%
+  mutate(
+    across(starts_with("origin_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .)),
+    across(starts_with("dest_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .))
+  ) %>%
+  select(-ends_with("_m"), -day_of_year, -week_of_year)
+
+# 2. Hybrid (monthly for all EXCEPT weekly VISIB)
+cancel_train_hybrid <- cancel_train %>%
+  left_join(monthly_all_origin, by = c("Origin", "Month"), suffix = c("", "_m")) %>%
+  left_join(monthly_all_dest, by = c("Dest", "Month"), suffix = c("", "_m")) %>%
+  left_join(weekly_visib_origin, by = c("Origin", "week_of_year"), suffix = c("", "_w")) %>%
+  left_join(weekly_visib_dest, by = c("Dest", "week_of_year"), suffix = c("", "_w")) %>%
+  mutate(
+    # Replace all features with monthly averages
+    across(starts_with("origin_") & !ends_with("_m") & !ends_with("_w"), 
+           ~coalesce(get(paste0(cur_column(), "_m")), .)),
+    across(starts_with("dest_") & !ends_with("_m") & !ends_with("_w"), 
+           ~coalesce(get(paste0(cur_column(), "_m")), .)),
+    # EXCEPT VISIB - use weekly (with monthly fallback)
+    origin_VISIB = coalesce(origin_VISIB_w, origin_VISIB_m, origin_VISIB),
+    dest_VISIB = coalesce(dest_VISIB_w, dest_VISIB_m, dest_VISIB)
+  ) %>%
+  select(-ends_with("_m"), -ends_with("_w"), -day_of_year, -week_of_year)
+
+cancel_test_hybrid <- cancel_test %>%
+  left_join(monthly_all_origin, by = c("Origin", "Month"), suffix = c("", "_m")) %>%
+  left_join(monthly_all_dest, by = c("Dest", "Month"), suffix = c("", "_m")) %>%
+  left_join(weekly_visib_origin, by = c("Origin", "week_of_year"), suffix = c("", "_w")) %>%
+  left_join(weekly_visib_dest, by = c("Dest", "week_of_year"), suffix = c("", "_w")) %>%
+  mutate(
+    across(starts_with("origin_") & !ends_with("_m") & !ends_with("_w"), 
+           ~coalesce(get(paste0(cur_column(), "_m")), .)),
+    across(starts_with("dest_") & !ends_with("_m") & !ends_with("_w"), 
+           ~coalesce(get(paste0(cur_column(), "_m")), .)),
+    origin_VISIB = coalesce(origin_VISIB_w, origin_VISIB_m, origin_VISIB),
+    dest_VISIB = coalesce(dest_VISIB_w, dest_VISIB_m, dest_VISIB)
+  ) %>%
+  select(-ends_with("_m"), -ends_with("_w"), -day_of_year, -week_of_year)
+
+# Regional (WAC) Fallback for NAs ==============================================
+
+origin_wac_weather <- cancel_train %>%
+  group_by(OriginWac, Month) %>%
+  summarise(across(starts_with("origin_"), ~mean(., na.rm = TRUE)), 
+            .groups = "drop")
+
+dest_wac_weather <- cancel_train %>%
+  group_by(DestWac, Month) %>%
+  summarise(across(starts_with("dest_"), ~mean(., na.rm = TRUE)), 
+            .groups = "drop")
+
+global_weather <- cancel_train %>%
+  summarise(across(starts_with("origin_") | starts_with("dest_"), 
+                   ~mean(., na.rm = TRUE)))
+
+fill_weather_nas <- function(data, wac_origin, wac_dest, global) {
+  data_with_wac <- data %>%
+    left_join(wac_origin, by = c("OriginWac", "Month"), suffix = c("", "_wac_o")) %>%
+    left_join(wac_dest, by = c("DestWac", "Month"), suffix = c("", "_wac_d"))
+  
+  origin_features <- names(data) %>% str_subset("^origin_")
+  for (feat in origin_features) {
+    wac_col <- paste0(feat, "_wac_o")
+    global_val <- global[[feat]]
+    
+    data_with_wac[[feat]] <- case_when(
+      !is.na(data_with_wac[[feat]]) ~ data_with_wac[[feat]],
+      !is.na(data_with_wac[[wac_col]]) ~ data_with_wac[[wac_col]],
+      TRUE ~ global_val
+    )
+  }
+  
+  dest_features <- names(data) %>% str_subset("^dest_")
+  for (feat in dest_features) {
+    wac_col <- paste0(feat, "_wac_d")
+    global_val <- global[[feat]]
+    
+    data_with_wac[[feat]] <- case_when(
+      !is.na(data_with_wac[[feat]]) ~ data_with_wac[[feat]],
+      !is.na(data_with_wac[[wac_col]]) ~ data_with_wac[[wac_col]],
+      TRUE ~ global_val
+    )
+  }
+  
+  data_with_wac %>% select(-ends_with("_wac_o"), -ends_with("_wac_d"))
+}
+
+fill_remaining_nas <- function(data) {
+  data %>% mutate(across(where(is.numeric), ~ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+}
+
+# Apply NA filling
+cancel_train_monthly <- fill_weather_nas(cancel_train_monthly, origin_wac_weather, 
+                                         dest_wac_weather, global_weather)
+cancel_test_monthly <- fill_weather_nas(cancel_test_monthly, origin_wac_weather, 
+                                        dest_wac_weather, global_weather)
+
+cancel_train_hybrid <- fill_weather_nas(cancel_train_hybrid, origin_wac_weather, 
+                                        dest_wac_weather, global_weather)
+cancel_test_hybrid <- fill_weather_nas(cancel_test_hybrid, origin_wac_weather, 
+                                       dest_wac_weather, global_weather)
+
+cancel_train_monthly <- fill_remaining_nas(cancel_train_monthly)
+cancel_test_monthly <- fill_remaining_nas(cancel_test_monthly)
+cancel_train_hybrid <- fill_remaining_nas(cancel_train_hybrid)
+cancel_test_hybrid <- fill_remaining_nas(cancel_test_hybrid)
+```
+
+Global means for fallback:
+  Origin visibility: 9.27 miles
+  Dest visibility: 9.27 miles
+
+After NA removal:
+  Origin visibility NAs: 0 
+  Dest visibility NAs: 0 
+
+Final dataset NA check:
+  Train origin_VISIB NAs: 0 
+  Train dest_VISIB NAs: 0 
+  Test origin_VISIB NAs: 0 
+  Test dest_VISIB NAs: 0 
+  Train total NAs: 0 
+  Test total NAs: 0 
+```{r}
+# Training Function ============================================================
+set.seed(42)
+train_cancel_model <- function(train_df, test_df, params) {
+  # Remove Year and create DMatrix
+  train_matrix <- train_df %>% select(-Cancelled, -Year) %>% as.matrix()
+  test_matrix <- test_df %>% select(-Cancelled, -Year) %>% as.matrix()
+  
+  storage.mode(train_matrix) <- "double"
+  storage.mode(test_matrix) <- "double"
+  
+  dtrain <- xgb.DMatrix(train_matrix, label = as.numeric(train_df$Cancelled))
+  dtest <- xgb.DMatrix(test_matrix, label = as.numeric(test_df$Cancelled))
+  
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 300,
+    watchlist = list(test = dtest),
+    early_stopping_rounds = 30,
+    verbose = 0
+  )
+  
+  list(model = model, dtest = dtest)
+}
+
+# Train Models =================================================================
+set.seed(42)
+# Calculate class imbalance
+class_stats_hybrid <- cancel_train_hybrid %>%
+  summarise(
+    neg = sum(Cancelled == 0),
+    pos = sum(Cancelled == 1),
+    ratio = neg / pos
+  )
+
+class_stats_monthly <- cancel_train_monthly %>%
+  summarise(
+    neg = sum(Cancelled == 0),
+    pos = sum(Cancelled == 1),
+    ratio = neg / pos
+  )
+
+# Monthly ranking model
+monthly_ranking <- train_cancel_model(
+  cancel_train_monthly, 
+  cancel_test_monthly,
+  list(
+    objective = "binary:logistic", 
+    eval_metric = "auc", 
+    max_depth = 4, 
+    eta = 0.05, 
+    min_child_weight = 5, 
+    subsample = 0.8, 
+    colsample_bytree = 0.8, 
+    scale_pos_weight = class_stats_monthly$ratio
+  )
+)
+
+# Hybrid ranking model
+hybrid_ranking <- train_cancel_model(
+  cancel_train_hybrid, 
+  cancel_test_hybrid,
+  list(
+    objective = "binary:logistic", 
+    eval_metric = "auc", 
+    max_depth = 4, 
+    eta = 0.05, 
+    min_child_weight = 5, 
+    subsample = 0.8, 
+    colsample_bytree = 0.8, 
+    scale_pos_weight = class_stats_hybrid$ratio
+  )
+)
+
+```
+
+### 3.6.6 Model Evaluation: Hybrid vs Pure Monthly
+
+**Purpose:** Compare two model configurationsto find the optimal booking-time prediction setup.
+
+```{r evaluate-three-approaches}
+# Model Evaluation =============================================================
+# Evaluation function
+evaluate_cancel_model <- function(model_result, test_df, approach_name, feature_type) {
+  # Make predictions
+  preds <- predict(model_result$model, model_result$dtest)
+  
+  # ROC analysis
+  roc_obj <- roc(test_df$Cancelled, preds, quiet = TRUE)
+  optimal_threshold <- coords(roc_obj, "best")$threshold
+  
+  # Predicted classes
+  pred_class <- ifelse(preds > optimal_threshold, 1, 0) %>% factor()
+  true_class <- test_df$Cancelled %>% factor()
+  
+  # Confusion matrix
+  cm <- confusionMatrix(pred_class, true_class, positive = "1")
+  
+  # Calculate metrics
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  
+  # Return as tibble
+  tibble(
+    Features = feature_type,
+    Approach = approach_name,
+    AUC = round(auc(roc_obj), 4),
+    Precision = sprintf("%.1f%%", precision * 100),
+    Recall = sprintf("%.1f%%", recall * 100),
+    Specificity = sprintf("%.1f%%", cm$byClass["Specificity"] * 100),
+    `F1-Score` = round(f1, 3)
+  )
+}
+
+# Evaluate All Models ==========================================================
+results_list <- list(
+  evaluate_cancel_model(monthly_ranking, cancel_test_monthly, 
+                        "Ranking", "Pure Monthly"),
+  evaluate_cancel_model(hybrid_ranking, cancel_test_hybrid, 
+                        "Ranking", "Hybrid (weekly VISIB)")  # Changed from "VISIB 7-day"
+)
+
+comparison_df <- bind_rows(results_list)
+
+kable(comparison_df, format = "simple", align = c("l", "l", rep("r", 5)))
+
+```
+
+The results show that pure monthly weather features perform best, with AUC of 0.6864 compared to the hybrid model's 0.6829 (−0.0035). This indicates that adding weekly-level detail for visibility does not improve how well the model ranks cancellation risk.
+The hybrid model shows slightly higher recall (66.5% vs 63.4%), capturing more actual cancellations, but at the cost of lower specificity (59.7% vs 63.0%) — meaning it flags more false positives. The pure monthly model achieves marginally better precision (3.1% vs 3.0%) and a slightly better F1-score (0.059 vs 0.057).
+For our insurance application, we select the pure monthly ranking model as the final choice. This model achieves the best AUC (0.6864) with stable, reliable estimates from 240+ observations per airport-month. The weekly VISIB approach, despite using ~56 observations per airport-week, adds noise rather than signal — the within-week variance in visibility is overshadowed by the sparsity of the data.
+Overall, the key takeaway is that temporal granularity has limits: With 8 years of training data, monthly weather averages provide optimal cancellation risk ranking. Attempts to add daily or weekly granularity for visibility (7-day smoothed or weekly averages) do not improve performance, demonstrating that monthly aggregation strikes the right balance between precision and sample size for booking-time prediction.
+
+### 3.6.7 Final Model Selection and Interpretation
+
+Analyzing feature importance hybrid_baseline model
+```{r final-model-selection}
+# Feature Importance Comparison ================================================
+
+# Get importance from both models
+importance_monthly <- xgb.importance(model = monthly_ranking$model) %>%
+  as_tibble() %>%
+  mutate(Model = "Pure Monthly")
+
+importance_hybrid <- xgb.importance(model = hybrid_ranking$model) %>%
+  as_tibble() %>%
+  mutate(Model = "Hybrid (7-day VISIB)")
+
+# Combine both
+importance_combined <- bind_rows(importance_monthly, importance_hybrid)
+
+# Get top 15 features from each model
+top_15_monthly <- importance_monthly %>%
+  slice_max(Gain, n = 15) %>%
+  arrange(Gain)
+
+top_15_hybrid <- importance_hybrid %>%
+  slice_max(Gain, n = 15) %>%
+  arrange(Gain)
+
+
+# 1. Prepare Pure Monthly Plot (The Winner)
+p1 <- ggplot(top_15_monthly, aes(x = Gain, y = reorder(Feature, Gain))) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(
+    title = "Pure Monthly Model",
+    subtitle = "AUC: 0.6864 (More Stable)",
+    x = "Gain",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# 2. Prepare Hybrid Plot (The Experiment)
+p2 <- ggplot(top_15_hybrid, aes(x = Gain, y = reorder(Feature, Gain))) +
+  geom_col(fill = "darkgreen", alpha = 0.8) +
+  labs(
+    title = "Hybrid (Weekly VISIB)",
+    subtitle = "AUC: 0.6829 (Higher Noise)",
+    x = "Gain",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# 3. Combine side-by-side
+p1 + p2 + 
+  plot_annotation(
+    title = "Booking-Time Model Comparison: Monthly vs. Weekly Granularity",
+    subtitle = "Note how Visibility (VISIB) Gain increases in the Hybrid model but overall AUC drops due to noise.",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+# 4. Correct final model assignment
+final_model <- monthly_ranking$model
+dtest <- monthly_ranking$dtest
+cancel_test <- cancel_test_monthly
+```
+Pure Monthly Model (AUC: 0.6864):
+Month ranks 2nd in feature importance (gain ≈ 0.085), serving as the primary seasonal weather proxy. Without refined visibility, the model relies on Month to capture winter storms and summer patterns. Reporting_Airline dominates, while route geography (OriginWac, DestWac) and temporal features (DayofMonth, CRSDepTime) rank highly.
+Weather features appear throughout the top 15 (dest_MIN, origin_MIN, origin_VISIB, dest_WDSP), but monthly aggregation provides stable estimates from 240+ observations per airport-month. The model knows "January is risky" as a general pattern, which proves sufficient for booking-time prediction.
+
+Hybrid Model with Weekly VISIB (AUC: 0.6829):
+The hybrid model shows a notable shift: origin_VISIB jumps from 11th place (gain ≈ 0.030) in pure monthly to 6th place (gain ≈ 0.050) in the hybrid model — the model is using the weekly VISIB information. However, this comes at a cost: the increased feature importance for VISIB doesn't translate to better overall performance.
+The issue is sample sparsity: With only ~56 observations per airport-week (versus 240+ for monthly), weekly VISIB estimates are noisy. The model gives VISIB more weight but gets less reliable information, ultimately hurting prediction accuracy (-0.0035 AUC).
+This pattern demonstrates a key principle: feature importance ≠ feature quality. The hybrid model uses weekly VISIB more (higher gain), but the noisy estimates make the model worse overall.
+
+Conclusion:
+For booking-time cancellation prediction with 8 years of training data, monthly weather aggregation is optimal. Attempts to refine temporal granularity (weekly VISIB, daily smoothing) introduce more noise than signal. The pure monthly model's reliance on Month as a seasonal proxy is actually a strength — it captures the stable seasonal patterns that matter for long-term risk assessment, without overfitting to sparse week-level estimates.
+
+
+### 3.6.8 Hyperparameter Optimization with Proper Temporal Cross-Validation
+
+**Key Challenge:** Weather features must be recomputed PER FOLD using only training years to avoid data leakage.
+
+**The Approach:** 
+- 4-fold temporal CV (train on 2010-2015, test 2016; train 2010-2016, test 2017; etc.)
+- Each fold recomputes monthly weather from its own training years only
+
+**Note:** The following chunk is set to `eval=FALSE` as it takes ~1 hour to run. Results are pre-computed.
+
+- Bayesian optimization searches hyperparameter space to maximize mean CV AUC
+- This ensures honest performance estimates for booking-time prediction
+```{r eval=FALSE}
+# ══════════════════════════════════════════════════════════════
+# BAYESIAN OPTIMIZATION WITH MONTHLY WEATHER
+# Proper Temporal CV - No Data Leakage
+# Each fold recomputes monthly weather from its training years only
+# ══════════════════════════════════════════════════════════════
+# Load Fresh Data for Optimization =============================================
+
+cat("Loading data for Bayesian optimization...\n")
+
+# Load original unencoded data
+df_original <- read_parquet("merged_weather_final.parquet")
+
+# Get encoding levels
+airline_levels <- df_original %>% pull(Reporting_Airline) %>% unique() %>% sort()
+origin_levels <- df_original %>% pull(Origin) %>% unique() %>% sort()
+dest_levels <- df_original %>% pull(Dest) %>% unique() %>% sort()
+
+# Encode data
+df_encoded <- df_original %>%
+  mutate(
+    Reporting_Airline = as.integer(factor(Reporting_Airline, levels = airline_levels)),
+    Origin = as.integer(factor(Origin, levels = origin_levels)),
+    Dest = as.integer(factor(Dest, levels = dest_levels))
+  )
+
+# CRITICAL: Only use 2010-2018 for hyperparameter optimization
+train_full_opt <- df_encoded %>% filter(Year != 2019)
+
+# Prepare RAW data (before weather averaging)
+cancel_model_data_raw <- train_full_opt %>%
+  filter(!is.na(Cancelled)) %>%
+  select(all_of(booking_features), Cancelled)
+
+cat("✓ Data prepared:", nrow(cancel_model_data_raw), "training flights\n\n")
+
+# CV folds - only use 2010-2018 data (NO 2019!)
+folds_cancel <- list(
+  list(train_years = 2010:2014, test_year = 2015),
+  list(train_years = 2010:2015, test_year = 2016),
+  list(train_years = 2010:2016, test_year = 2017),
+  list(train_years = 2010:2017, test_year = 2018)
+)
+
+# Scoring Function =============================================================
+
+scoring_cancel <- function(max_depth, eta, min_child_weight,
+                           subsample, colsample_bytree, scale_pos_weight) {
+  
+  fold_aucs <- map_dbl(folds_cancel, function(fold) {
+    train_fold_raw <- cancel_model_data_raw %>% 
+      filter(Year %in% fold$train_years)
+    
+    test_fold_raw <- cancel_model_data_raw %>% 
+      filter(Year == fold$test_year)
+    
+    # Compute monthly weather averages from training fold only
+    monthly_weather_origin_fold <- train_fold_raw %>%
+      group_by(Origin, Month) %>%
+      summarise(across(starts_with("origin_"), ~mean(., na.rm = TRUE)), .groups = "drop")
+    
+    monthly_weather_dest_fold <- train_fold_raw %>%
+      group_by(Dest, Month) %>%
+      summarise(across(starts_with("dest_"), ~mean(., na.rm = TRUE)), .groups = "drop")
+    
+    # Apply monthly weather to train and test
+    train_fold <- train_fold_raw %>%
+      left_join(monthly_weather_origin_fold, by = c("Origin", "Month"), suffix = c("", "_m")) %>%
+      left_join(monthly_weather_dest_fold, by = c("Dest", "Month"), suffix = c("", "_m")) %>%
+      mutate(
+        across(starts_with("origin_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .)),
+        across(starts_with("dest_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .))
+      ) %>%
+      select(-ends_with("_m"))
+    
+    test_fold <- test_fold_raw %>%
+      left_join(monthly_weather_origin_fold, by = c("Origin", "Month"), suffix = c("", "_m")) %>%
+      left_join(monthly_weather_dest_fold, by = c("Dest", "Month"), suffix = c("", "_m")) %>%
+      mutate(
+        across(starts_with("origin_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .)),
+        across(starts_with("dest_") & !ends_with("_m"), ~coalesce(get(paste0(cur_column(), "_m")), .))
+      ) %>%
+      select(-ends_with("_m"))
+    
+    # Final NA removal
+    train_fold <- train_fold %>%
+      mutate(across(where(is.numeric), ~ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+      select(-Year)
+    
+    test_fold <- test_fold %>%
+      mutate(across(where(is.numeric), ~ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+      select(-Year)
+    
+    # Train model
+    train_matrix <- train_fold %>% select(-Cancelled) %>% as.matrix()
+    test_matrix <- test_fold %>% select(-Cancelled) %>% as.matrix()
+    
+    storage.mode(train_matrix) <- "double"
+    storage.mode(test_matrix) <- "double"
+    
+    dtrain_f <- xgb.DMatrix(data = train_matrix, label = as.numeric(train_fold$Cancelled))
+    dtest_f <- xgb.DMatrix(data = test_matrix, label = as.numeric(test_fold$Cancelled))
+    
+    model_f <- xgb.train(
+      params = list(
+        objective        = "binary:logistic",
+        eval_metric      = "auc",
+        max_depth        = as.integer(max_depth),
+        eta              = eta,
+        min_child_weight = min_child_weight,
+        subsample        = subsample,
+        colsample_bytree = colsample_bytree,
+        scale_pos_weight = scale_pos_weight
+      ),
+      data                  = dtrain_f,
+      nrounds               = 300,
+      evals                 = list(test = dtest_f),
+      early_stopping_rounds = 30,
+      verbose               = 0
+    )
+    
+    preds <- predict(model_f, dtest_f)
+    as.numeric(auc(roc(test_fold$Cancelled, preds, quiet = TRUE)))
+  })
+  
+  list(Score = mean(fold_aucs), Pred = 0)
+}
+
+# Bayesian Optimization ========================================================
+
+neg <- sum(cancel_model_data_raw$Cancelled == 0)
+pos <- sum(cancel_model_data_raw$Cancelled == 1)
+class_ratio <- neg / pos
+
+bounds_cancel <- list(
+  max_depth        = c(4L, 8L),
+  eta              = c(0.01, 0.15),
+  min_child_weight = c(1L, 15L),
+  subsample        = c(0.5, 1.0),
+  colsample_bytree = c(0.5, 0.8),
+  scale_pos_weight = c(class_ratio * 0.5, class_ratio * 1.5)
+)
+
+cat("═══════════════════════════════════════════════════════════\n")
+cat("BAYESIAN OPTIMIZATION - MONTHLY WEATHER\n")
+cat("Using RANKING approach (eval_metric = AUC)\n")
+cat("═══════════════════════════════════════════════════════════\n\n")
+
+cat("Class imbalance:", sprintf("%.1f:1", class_ratio), "\n")
+cat("scale_pos_weight search range:", 
+    round(class_ratio * 0.5, 1), "to", round(class_ratio * 1.5, 1), "\n\n")
+
+cat("Starting Bayesian Optimization with proper temporal CV...\n")
+cat("Each fold recomputes monthly weather from training years only.\n\n")
+
+set.seed(42)
+
+bayes_cancel <- BayesianOptimization(
+  FUN         = scoring_cancel,
+  bounds      = bounds_cancel,
+  init_points = 5,
+  n_iter      = 20,
+  acq         = "ucb",
+  verbose     = TRUE
+)
+
+# Results ======================================================================
+
+cat("Best Hyperparameters:\n")
+print(bayes_cancel$Best_Par)
+cat("\nBest Mean CV AUC:", round(bayes_cancel$Best_Value, 4), "\n\n")
+
+# Save best parameters
+saveRDS(bayes_cancel$Best_Par, "cancel_monthly_best_params.rds")
+cat("✓ Best parameters saved: cancel_monthly_best_params.rds\n\n")
+
+# Visualization ================================================================
+
+bayes_cancel$History %>%
+  as_tibble() %>%
+  mutate(
+    Iteration = row_number(),
+    Best_AUC  = cummax(Value)
+  ) %>%
+  ggplot(aes(x = Iteration)) +
+  geom_line(aes(y = Best_AUC, color = "Best So Far"), linewidth = 1) +
+  geom_point(aes(y = Value, color = "Trial AUC"), alpha = 0.6, size = 2) +
+  scale_color_manual(values = c("Best So Far" = "darkgreen", "Trial AUC" = "gray50")) +
+  labs(
+    title = "Bayesian Optimization: Cancellation Model (Monthly Weather)",
+    subtitle = sprintf("Best Mean CV AUC: %.4f | Temporal validation (2015-2018)", 
+                       bayes_cancel$Best_Value),
+    x = "Iteration",
+    y = "Mean CV AUC (4-fold temporal validation)",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+
+**Optimization Result:** Best model uses depth=, eta≈0.011, high regularization (min_child_weight=12), and scale_pos_weight≈42. Mean CV AUC of 0.7567 represents honest booking-time performance.
+
+### 3.6.9 Final Model Training and Economic Threshold Analysis
+
+**Training the production model** with optimized hyperparameters on full 2010-2018 data, then evaluating multiple thresholds to identify the **18% break-even point** for insurance recommendations.
+
+```{r}
+# ════════════════════════════════════════════════════════════
+# TRAIN FINAL PRODUCTION MODEL — BOOKING TIME (CANCEL)
+# ════════════════════════════════════════════════════════════
+
+cat("═══════════════════════════════════════════════════════════\n")
+cat("TRAINING FINAL PRODUCTION MODEL (CANCEL - BOOKING TIME)\n")
+cat("Optimized Hyperparameters (Fixed)\n")
+cat("═══════════════════════════════════════════════════════════\n\n")
+
+# ---------------------------------------------------------
+# PREPARE DATA
+# ---------------------------------------------------------
+train_clean <- cancel_train_monthly %>% select(-Cancelled, -Year)
+test_clean  <- cancel_test_monthly %>% select(-Cancelled, -Year)
+
+train_matrix <- as.matrix(train_clean)
+test_matrix  <- as.matrix(test_clean)
+
+storage.mode(train_matrix) <- "double"
+storage.mode(test_matrix)  <- "double"
+
+dtrain <- xgb.DMatrix(
+  data  = train_matrix,
+  label = as.numeric(cancel_train_monthly$Cancelled)
+)
+
+dtest <- xgb.DMatrix(
+  data  = test_matrix,
+  label = as.numeric(cancel_test_monthly$Cancelled)
+)
+
+cat("Training data prepared:\n")
+cat("  Train observations:", nrow(cancel_train_monthly), "\n")
+cat("  Test observations:", nrow(cancel_test_monthly), "\n")
+cat("  Features:", ncol(train_clean), "\n\n")
+
+# ---------------------------------------------------------
+# TRAIN MODEL (FIXED PARAMETERS)
+# ---------------------------------------------------------
+set.seed(42)
+
+final_model_optimised_booking_cancel <- xgb.train(
+  params = list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = 5,
+    eta              = 0.1124998,
+    min_child_weight = 12,
+    subsample        = 1.0,
+    colsample_bytree = 0.6813041,
+    scale_pos_weight = 42.6737143
+  ),
+  data                  = dtrain,
+  nrounds               = 300,
+  watchlist             = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 30,
+  verbose               = 1
+)
+
+# ---------------------------------------------------------
+# PREDICTIONS + PERFORMANCE
+# ---------------------------------------------------------
+preds_cancel_booking <- predict(final_model_optimised_booking_cancel, dtest)
+
+roc_obj <- roc(cancel_test_monthly$Cancelled, preds_cancel_booking, quiet = TRUE)
+test_auc <- as.numeric(auc(roc_obj))
+
+cat(sprintf("\nTest AUC (Booking Cancel Model): %.4f\n\n", test_auc))
+
+# ---------------------------------------------------------
+# SAVE FOR LATER USE (APP / PLOTS)
+# ---------------------------------------------------------
+saveRDS(final_model_optimised_booking_cancel, "model_cancel_booking.rds")
+
+# ---------------------------------------------------------
+# INSURANCE SETTINGS
+# ---------------------------------------------------------
+premium_pct <- 6.5   # % of ticket price
+
+# ---------------------------------------------------------
+# RISK TIERS
+# ---------------------------------------------------------
+risk_percentiles <- c(0.99, 0.98, 0.95, 0.90, 0.80, 0.70, 0.60, 0.50,
+                      0.40, 0.30, 0.20, 0.10, 0.00)
+
+risk_labels <- c("Top 1%", "Top 2%", "Top 5%", "Top 10%", "Top 20%", "Top 30%",
+                 "Top 40%", "Top 50%", "Top 60%", "Top 70%", "Top 80%", "Top 90%", "Baseline")
+
+# ---------------------------------------------------------
+# COMPUTE CANCEL RATES + EXPECTED VALUE
+# ---------------------------------------------------------
+compute_cancel_thresholds <- function(preds, actuals, premium) {
+  
+  results <- list()
+  
+  for (i in seq_along(risk_percentiles)) {
+    
+    pct <- risk_percentiles[i]
+    label <- risk_labels[i]
+    
+    if (pct == 0) {
+      mask <- rep(TRUE, length(preds))
+    } else {
+      threshold <- quantile(preds, pct)
+      mask <- preds >= threshold
+    }
+    
+    tier_actuals <- actuals[mask]
+    
+    cancel_rate <- mean(tier_actuals) * 100
+    EV <- cancel_rate - premium
+    
+    decision <- ifelse(
+      EV > 0, "BUY",
+      ifelse(abs(EV) < 0.3, "BREAK-EVEN", "SKIP")
+    )
+    
+    results[[paste0("tier_", i)]] <- list(
+      label = label,
+      sample_size = length(tier_actuals),
+      cancel_rate = cancel_rate,
+      EV = EV,
+      decision = decision
+    )
+    
+    cat(sprintf("  %s: n=%d | cancel rate = %.2f%% | EV = %+0.2f\n",
+                label, length(tier_actuals), cancel_rate, EV))
+  }
+  
+  return(results)
+}
+
+# ---------------------------------------------------------
+# RUN ANALYSIS
+# ---------------------------------------------------------
+cancel_booking_results <- compute_cancel_thresholds(
+  preds_cancel_booking,
+  cancel_test_monthly$Cancelled,
+  premium_pct
+)
+
+# ---------------------------------------------------------
+# BUILD DATAFRAME (FOR HEATMAP)
+# ---------------------------------------------------------
+build_cancel_df <- function(results, model_name) {
+  
+  df_list <- list()
+  
+  for (i in seq_along(results)) {
+    
+   tier_data <- results[[i]]
+    
+    df_list[[i]] <- data.frame(
+      Model = model_name,
+      Risk = tier_data$label,
+      CancelRate = tier_data$cancel_rate,
+      EV = tier_data$EV,
+      Decision = tier_data$decision
+    )
+  }
+  
+  bind_rows(df_list)
+}
+
+cancel_booking_df <- build_cancel_df(cancel_booking_results, "Booking")
+
+# Factor ordering
+cancel_booking_df$Risk <- factor(cancel_booking_df$Risk, levels = risk_labels)
+```
+
+```{r fig.width=12, fig.height=7, dpi=300}
+importance_cancel_booking <- xgb.importance(model = suppressWarnings(readRDS("model_cancel_booking.rds")))
+live_cancel_model         <- readRDS("model_cancel_live.rds")
+importance_cancel_live    <- xgb.importance(model = live_cancel_model)
+
+categorize <- function(df, model_name) {
+  df %>%
+    mutate(Category = case_when(
+      Feature %in% c("Year", "Quarter", "Month", "DayofMonth", "DayOfWeek", "CRSDepTime") ~ "Date/Time",
+      Feature %in% c("CRSElapsedTime", "Distance") ~ "Distance/\nDuration",
+      Feature %in% c("Origin", "Dest", "OriginWac", "DestWac") ~ "Origin/Dest",
+      Feature == "Reporting_Airline" ~ "Airline",
+      Feature == "avg_fare" ~ "Price",
+      grepl("^origin_|^dest_", Feature) ~ "Weather",
+      TRUE ~ "Other"
+    )) %>%
+    group_by(Category) %>%
+    summarise(Gain = sum(Gain), .groups = "drop") %>%
+    mutate(Model = model_name)
+}
+
+
+importance_combined_cancel <- bind_rows(
+  categorize(importance_cancel_booking, "Booking (AUC = 0.69)"),
+  categorize(importance_cancel_live,    "Live Weather (AUC = 0.79)")
+)
+importance_combined_cancel$Category <- factor(
+  importance_combined_cancel$Category,
+  levels = c("Date/Time", "Weather", "Origin/Dest", "Airline", "Distance/\nDuration", "Price")
+)
+category_colors <- c(
+  "Date/Time"           = "#f39c12",
+  "Weather"             = "#00A1DE",
+  "Origin/Dest"         = "#2ecc71",
+  "Airline"             = "#e74c3c",
+  "Distance/\nDuration" = "#9b59b6",
+  "Price"               = "#1abc9c"
+)
+
+ggplot(importance_combined_cancel, aes(x = Category, y = Gain, fill = Category)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", Gain)),
+            position = position_dodge(width = 0.7),
+            vjust = -0.4, size = 3.5, fontface = "bold") +
+  facet_wrap(~ Model) +
+  scale_fill_manual(values = category_colors, guide = "none") +
+  scale_y_continuous(limits = c(0, 0.64 ), labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Feature Importance by Category: Cancellation Model",
+    subtitle = "Gain aggregated per category, Booking vs Live Weather model",
+    x = NULL,
+    y = "Total Gain"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.text         = element_text(face = "bold", size = 13),
+    strip.background   = element_rect(fill = "#f0f0f0", color = NA),
+    plot.title         = element_text(face = "bold", size = 14)
+  )
+# Evaluate and display only the booking time optimised stats
+evaluate_cancel(list(model = final_model_optimised_booking_cancel, dtest = dtest), 
+                "Booking Time (Optimised)") %>%
+  kable() %>%
+  kable_styling()
+```
+```{r}
+full_importance_cancel <- bind_rows(
+  importance_cancel_booking %>% mutate(Model = "Booking (AUC = 0.69)"),
+  importance_cancel_live    %>% mutate(Model = "Live Weather (AUC = 0.79)")
+) %>%
+  mutate(Category = case_when(
+    Feature %in% c("Year", "Quarter", "Month", "DayofMonth", "DayOfWeek", "CRSDepTime", "day_of_year", "week_of_year") ~ "Date/Time",
+    Feature %in% c("CRSElapsedTime", "Distance") ~ "Distance/Duration",
+    Feature %in% c("Origin", "Dest", "OriginWac", "DestWac") ~ "Origin/Dest",
+    Feature == "Reporting_Airline" ~ "Airline",
+    Feature == "avg_fare" ~ "Price",
+    grepl("^origin_|^dest_", Feature) ~ "Weather",
+    TRUE ~ "Other"
+  )) %>%
+  select(Model, Category, Feature, Gain) %>%
+  arrange(Category, desc(Gain))
+
+category_bg <- c(
+  "Date/Time"         = "#fde8c8",
+  "Distance/Duration" = "#e8d5f5",
+  "Origin/Dest"       = "#c8f0d8",
+  "Airline"           = "#fad4d4",
+  "Price"             = "#c8f5ee",
+  "Weather"           = "#c8e8f5"
+)
+
+full_importance_cancel_wide <- full_importance_cancel %>%
+  pivot_wider(names_from = Model, values_from = Gain) %>%
+  arrange(Category, desc(`Booking (AUC = 0.69)`)) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+full_importance_cancel_wide %>%
+  kable(format = "html", caption = "Full Feature Importance — Cancellation Model") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "condensed")) %>%
+  column_spec(1, background = category_bg[full_importance_cancel_wide$Category])
+```
+
+**Threshold Strategy:** Test multiple percentile-based thresholds to map precision values to **economic decision tiers**. The goal is to identify where expected value becomes non-negative (break-even) and establish risk-based recommendation strength above that point.
+
+```{r}
+# Predictions ==================================================================
+
+preds <- predict(final_model_optimised_booking_cancel, dtest)
+
+roc_obj <- roc(cancel_test_hybrid$Cancelled, preds, quiet = TRUE)
+
+# Define thresholds
+thresholds <- c(
+  quantile(preds, c(0.025, 0.83, 0.85, 0.895, 0.96995, 0.98, 0.99))
+)
+
+# Calculate metrics for each threshold
+threshold_results <- tibble(Threshold = thresholds) %>%
+  mutate(
+    cm = map(Threshold, ~confusionMatrix(
+      factor(ifelse(preds > .x, 1, 0), levels = c(0, 1)),
+      factor(cancel_test_hybrid$Cancelled, levels = c(0, 1)),
+      positive = "1"
+    )),
+    Precision = map_dbl(cm, ~.x$byClass["Pos Pred Value"]),
+    Recall = map_dbl(cm, ~.x$byClass["Sensitivity"]),
+    Specificity = map_dbl(cm, ~.x$byClass["Specificity"]),
+    F1 = 2 * (Precision * Recall) / (Precision + Recall),
+    Baseline_Rate = mean(cancel_test_hybrid$Cancelled),
+    Lift = Precision / Baseline_Rate,
+    Top_Pct = map_dbl(Threshold, ~mean(preds > .x) * 100)
+  ) %>%
+  transmute(
+    Threshold = round(Threshold, 4),
+    Top_Pct = sprintf("%.1f%%", Top_Pct),
+    AUC = round(auc(roc_obj), 4),
+    Precision = sprintf("%.2f%%", Precision * 100),
+    Recall = sprintf("%.1f%%", Recall * 100),
+    Specificity = sprintf("%.1f%%", Specificity * 100),
+    F1 = round(F1, 3),
+    Lift = sprintf("%.2fx", Lift)
+  )
+
+kable(threshold_results, format = "simple")
+```
+
+```{r}
+df_original <- read_parquet("merged_weather_final.parquet")
+
+production_thresholds_cancel <- list(
+  # Model performance
+  model_auc = as.numeric(auc(roc_obj)),
+  base_cancel_rate = mean(cancel_test_monthly$Cancelled),
+  
+  # Insurance parameters
+  insurance_cost_pct = 6.5,
+  break_even_rate = 6.5,
+  
+  # Risk tier thresholds (12 tiers for maximum granularity)
+  top_1_pct = as.numeric(quantile(preds, 0.99)),
+  top_2_pct = as.numeric(quantile(preds, 0.98)),
+  top_3_pct = as.numeric(quantile(preds, 0.97)),    # Break-even
+  top_5_pct = as.numeric(quantile(preds, 0.95)),
+  top_10_pct = as.numeric(quantile(preds, 0.90)),
+  top_20_pct = as.numeric(quantile(preds, 0.80)),
+  top_30_pct = as.numeric(quantile(preds, 0.70)),
+  top_40_pct = as.numeric(quantile(preds, 0.60)),   # NEW
+  top_50_pct = as.numeric(quantile(preds, 0.50)),
+  top_60_pct = as.numeric(quantile(preds, 0.40)),   # NEW
+  top_70_pct = as.numeric(quantile(preds, 0.30)),   # NEW
+  top_80_pct = as.numeric(quantile(preds, 0.20)),   # NEW
+  
+  # Observed cancellation rates (12 tiers)
+  cancel_rate_top_1 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.99)]) * 100,
+  cancel_rate_top_2 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.98)]) * 100,
+  cancel_rate_top_3 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.97)]) * 100,
+  cancel_rate_top_5 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.95)]) * 100,
+  cancel_rate_top_10 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.90)]) * 100,
+  cancel_rate_top_20 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.80)]) * 100,
+  cancel_rate_top_30 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.70)]) * 100,
+  cancel_rate_top_40 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.60)]) * 100,  # NEW
+  cancel_rate_top_50 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.50)]) * 100,
+  cancel_rate_top_60 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.40)]) * 100,  # NEW
+  cancel_rate_top_70 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.30)]) * 100,  # NEW
+  cancel_rate_top_80 = mean(cancel_test_monthly$Cancelled[preds > quantile(preds, 0.20)]) * 100,  # NEW
+  
+  # Feature names
+  feature_names = colnames(cancel_train_monthly %>% select(-Cancelled, -Year)),
+  
+  # Categorical encodings
+  airline_levels = sort(unique(df_original$Reporting_Airline)),
+  origin_levels = sort(unique(df_original$Origin)),
+  dest_levels = sort(unique(df_original$Dest))
+)
+
+saveRDS(production_thresholds_cancel, "cancel_insurance_thresholds.rds")
+```
+
+markdownThe results demonstrate a clear precision-recall trade-off across thresholds, revealing the economic decision boundary for insurance recommendations.
+
+```{r}
+
+# Define base risk tiers so the extended tiers don't crash
+risk_percentiles <- c(0.99, 0.98, 0.95, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00)
+risk_labels <- c("Top 1%", "Top 2%", "Top 5%", "Top 10%", "Top 20%", "Top 30%", "Top 40%", "Top 50%", "Top 60%", "Top 70%", "Top 80%", "Top 90%", "Baseline")
+
+ordered_levels <- c(
+  "Top 1%", "Top 2%", "Top 3%", "Top 5%", "Top 10%",
+  "Top 17%", "Top 20%", "Top 30%", "Top 40%", "Top 50%",
+  "Top 60%", "Top 70%", "Top 80%", "Top 90%", "Baseline"
+)
+
+# ---------------------------------------------------------
+# DEFINE compute_cancel_ev (To prevent knit errors)
+# ---------------------------------------------------------
+compute_cancel_ev <- function(preds, actuals, premium) {
+  results <- list()
+  for (i in seq_along(risk_percentiles)) {
+    pct <- risk_percentiles[i]
+    label <- risk_labels[i]
+    if (pct == 0) { mask <- rep(TRUE, length(preds)) } 
+    else { mask <- preds >= quantile(preds, pct) }
+    
+    tier_actuals <- actuals[mask]
+    cancel_rate <- mean(tier_actuals) * 100
+    EV <- cancel_rate - premium
+    
+    decision <- case_when(
+      abs(EV) <= 0.3 ~ "BREAK-EVEN",
+      EV > 0 ~ "BUY",
+      TRUE ~ "SKIP"
+    )
+    results[[i]] <- data.frame(Risk = label, CancelRate = cancel_rate, EV = EV, Decision = decision)
+  }
+  bind_rows(results)
+}
+
+# ---------------------------------------------------------
+# COMPUTE BASE EV DATAFRAMES
+# ---------------------------------------------------------
+df_booking_ev <- compute_cancel_ev(
+  preds_cancel_booking,
+  cancel_test_monthly$Cancelled,
+  6.5
+) %>% mutate(Model = "Booking")
+
+df_live_ev <- compute_cancel_ev(
+  preds_cancel,
+  cancel_test$Cancelled,
+  6.5
+) %>% mutate(Model = "Live Weather")
+
+# Filtering
+plot_df_ev <- bind_rows(df_booking_ev, df_live_ev) %>%
+  filter(!is.na(Risk)) %>%                     
+  mutate(Risk = as.character(Risk)) %>%        
+  filter(Risk %in% ordered_levels) %>%         
+  mutate(Risk = factor(Risk, levels = ordered_levels))
+
+# ---------------------------------------------------------
+# ADD CUSTOM TIERS (KEY IDEA)
+# ---------------------------------------------------------
+extra_percentiles <- c(0.97, 0.83)   # Top 3%, Top 17%
+extra_labels <- c("Top 3%", "Top 17%")
+
+all_percentiles <- c(risk_percentiles, extra_percentiles)
+all_labels <- c(risk_labels, extra_labels)
+
+# ---------------------------------------------------------
+# FUNCTION (UPDATED)
+# ---------------------------------------------------------
+compute_cancel_thresholds_extended <- function(preds, actuals, premium) {
+  
+  results <- list()
+  
+  for (i in seq_along(all_percentiles)) {
+    
+    pct <- all_percentiles[i]
+    label <- all_labels[i]
+    
+    if (pct == 0) {
+      mask <- rep(TRUE, length(preds))
+    } else {
+      threshold <- quantile(preds, pct)
+      mask <- preds >= threshold
+    }
+    
+    tier_actuals <- actuals[mask]
+    
+    cancel_rate <- mean(tier_actuals) * 100
+    EV <- cancel_rate - premium
+    
+    decision <- case_when(
+      abs(cancel_rate - premium) < 0.3 ~ "BREAK-EVEN",
+      cancel_rate > premium ~ "BUY",
+      TRUE ~ "SKIP"
+    )
+    
+    results[[i]] <- data.frame(
+      Risk = label,
+      CancelRate = cancel_rate,
+      EV = EV,
+      Decision = decision
+    )
+  }
+  
+  bind_rows(results)
+}
+
+# ---------------------------------------------------------
+# RUN FOR BOTH MODELS
+# ---------------------------------------------------------
+cancel_booking_df_ext <- compute_cancel_thresholds_extended(
+  preds_cancel_booking,
+  cancel_test_monthly$Cancelled,
+  6.5
+) %>% mutate(Model = "Booking")
+
+cancel_live_df_ext <- compute_cancel_thresholds_extended(
+  preds_cancel,
+  cancel_test$Cancelled,
+  6.5
+) %>% mutate(Model = "Live Weather")
+
+plot_df_cancel <- bind_rows(cancel_booking_df_ext, cancel_live_df_ext)
+
+plot_df_cancel <- plot_df_cancel %>%
+  mutate(Risk = as.character(Risk)) %>%
+  filter(Risk %in% ordered_levels) %>%
+  mutate(Risk = factor(Risk, levels = ordered_levels))
+
+# ---------------------------------------------------------
+# ORDER FACTORS (IMPORTANT)
+# ---------------------------------------------------------
+plot_df_cancel$Risk <- factor(plot_df_cancel$Risk, levels = ordered_levels)
+
+plot_df_cancel$Model <- factor(
+  plot_df_cancel$Model,
+  levels = c("Booking", "Live Weather")
+)
+
+# ---------------------------------------------------------
+# PLOT
+# ---------------------------------------------------------
+ggplot(plot_df_cancel, aes(x = Model, y = Risk, fill = Decision)) +
+  
+  geom_tile(color = "white", linewidth = 0.5) +
+  
+  geom_text(aes(label = sprintf("%.1f%%", CancelRate)),
+            size = 4, fontface = "bold") +
+  scale_fill_manual(
+    values = c(
+      "BUY" = "#2ecc71",
+      "BREAK-EVEN" = "#f39c12",
+      "SKIP" = "#e74c3c"
+    )
+  ) +
+  
+  labs(
+    title = "Cancellation Insurance Decisions by Risk Tier",
+    subtitle = "Includes break-even tiers: Top 3% (Booking) and Top 17% (Live)",
+    x = "",
+    y = "Risk Tier"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+
+
+```{r}
+# ---------------------------------------------------------
+# ADD CUSTOM TIERS (Top 3% + Top 17%)
+# ---------------------------------------------------------
+extra_percentiles <- c(0.97, 0.83)
+extra_labels <- c("Top 3%", "Top 17%")
+
+all_percentiles <- c(risk_percentiles, extra_percentiles)
+all_labels <- c(risk_labels, extra_labels)
+
+# ---------------------------------------------------------
+# FUNCTION: COMPUTE EV
+# ---------------------------------------------------------
+compute_cancel_ev <- function(preds, actuals, premium) {
+  
+  results <- list()
+  
+  for (i in seq_along(all_percentiles)) {
+    
+    pct <- all_percentiles[i]
+    label <- all_labels[i]
+    
+    if (pct == 0) {
+      mask <- rep(TRUE, length(preds))
+    } else {
+      threshold <- quantile(preds, pct)
+      mask <- preds >= threshold
+    }
+    
+    tier_actuals <- actuals[mask]
+    
+    cancel_rate <- mean(tier_actuals) * 100
+    EV <- cancel_rate - premium
+    
+   decision <- case_when(
+  abs(EV) <= 0.3 ~ "BREAK-EVEN",  # prioritize this
+  EV > 0 ~ "BUY",
+  TRUE ~ "SKIP"
+)
+    
+    results[[i]] <- data.frame(
+      Risk = label,
+      CancelRate = cancel_rate,
+      EV = EV,
+      Decision = decision
+    )
+  }
+  
+  bind_rows(results)
+}
+
+# ---------------------------------------------------------
+# RUN FOR BOTH MODELS
+# ---------------------------------------------------------
+df_booking_ev <- compute_cancel_ev(
+  preds_cancel_booking,
+  cancel_test_monthly$Cancelled,
+  6.5
+) %>% mutate(Model = "Booking")
+
+df_live_ev <- compute_cancel_ev(
+  preds_cancel,
+  cancel_test$Cancelled,
+  6.5
+) %>% mutate(Model = "Live Weather")
+
+plot_df_ev <- bind_rows(df_booking_ev, df_live_ev)
+
+plot_df_ev <- bind_rows(df_booking_ev, df_live_ev) %>%
+  filter(!is.na(Risk)) %>%                     # remove NA tier
+  mutate(Risk = as.character(Risk)) %>%        # avoid factor issues
+  filter(Risk %in% ordered_levels) %>%         
+  mutate(Risk = factor(Risk, levels = ordered_levels))  
+# ---------------------------------------------------------
+# ORDER
+# ---------------------------------------------------------
+ordered_levels <- c(
+  "Top 1%", "Top 2%", "Top 3%", "Top 5%", "Top 10%",
+  "Top 17%", "Top 20%", "Top 30%", "Top 40%", "Top 50%",
+  "Top 60%", "Top 70%", "Top 80%", "Top 90%", "Baseline"
+)
+
+plot_df_ev$Risk <- factor(plot_df_ev$Risk, levels = ordered_levels)
+
+plot_df_ev$Model <- factor(
+  plot_df_ev$Model,
+  levels = c("Booking", "Live Weather")
+)
+
+# ---------------------------------------------------------
+# PLOT (EXPECTED VALUE)
+# ---------------------------------------------------------
+ggplot(plot_df_ev, aes(x = Model, y = Risk, fill = Decision)) +
+  
+  geom_tile(color = "white", linewidth = 0.5) +
+  
+  geom_text(aes(label = sprintf("%+.1f", EV)),
+            size = 4, fontface = "bold") +
+  
+  scale_fill_manual(
+    values = c(
+      "BUY" = "#2ecc71",
+      "BREAK-EVEN" = "#f39c12",
+      "SKIP" = "#e74c3c"
+    ),
+    name = "Expected Value"
+  ) +
+  
+  labs(
+    title = "Cancellation Insurance Expected Value by Risk Tier",
+    subtitle = "Includes break-even tiers: Top 3% (Booking) and Top 17% (Live)",
+    x = "",
+    y = "Risk Tier"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# SIMULATED MODEL IMPROVEMENT — CANCELLATION (FINAL CLEAN)
+# Booking (~0.69 AUC), Live (~0.79 AUC), Simulated (~0.85 / ~0.90+)
+# ══════════════════════════════════════════════════════════════
+
+set.seed(42)
+
+# ---------------------------------------------------------
+# TRUE SIGNAL
+# ---------------------------------------------------------
+actuals <- cancel_test_monthly$Cancelled
+
+# ---------------------------------------------------------
+# BASE MODELS
+# ---------------------------------------------------------
+preds_booking <- preds_cancel_booking   # ~0.69
+preds_live    <- preds_cancel           # ~0.79
+
+# ---------------------------------------------------------
+# SIMULATION FUNCTION (PROBABILISTIC)
+# ---------------------------------------------------------
+simulate_prob_preds <- function(signal, d_prime) {
+  noise <- rnorm(length(signal), 0, 1)
+  log_odds <- noise + (signal * d_prime) - (d_prime / 2)
+  probs <- 1 / (1 + exp(-log_odds))
+  return(probs)
+}
+
+# Simulated stronger models
+preds_085 <- simulate_prob_preds(actuals, d_prime = 2.2)
+preds_090 <- simulate_prob_preds(actuals, d_prime = 3.2)
+
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+premium_pct <- 6.5
+
+risk_percentiles <- c(
+  0.99, 0.98, 0.97, 0.95, 0.90, 0.83, 0.80, 0.75, 0.70,
+  0.60, 0.50, 0.40, 0.30, 0.20, 0.10, 0.00
+)
+
+risk_labels <- c(
+  "Top 1%", "Top 2%", "Top 3%", "Top 5%", "Top 10%", "Top 17%", "Top 20%", "Top 25%", "Top 30%",
+  "Top 40%", "Top 50%", "Top 60%", "Top 70%", "Top 80%", "Top 90%", "Baseline"
+)
+
+# ---------------------------------------------------------
+# COMPUTE SURFACE
+# ---------------------------------------------------------
+compute_surface <- function(preds, actuals) {
+  
+  df_list <- list()
+  
+  for (i in seq_along(risk_percentiles)) {
+    
+    pct <- risk_percentiles[i]
+    label <- risk_labels[i]
+    
+    if (pct == 0) {
+      mask <- rep(TRUE, length(preds))
+    } else {
+      threshold <- quantile(preds, pct)
+      mask <- preds >= threshold
+    }
+    
+    cancel_rate <- mean(actuals[mask]) * 100
+    EV <- cancel_rate - premium_pct
+    
+    df_list[[i]] <- data.frame(
+      Risk = label,
+      CancelRate = cancel_rate,
+      EV = EV
+    )
+  }
+  
+  bind_rows(df_list)
+}
+
+# ---------------------------------------------------------
+# BUILD DATA
+# ---------------------------------------------------------
+df_booking <- compute_surface(preds_booking, actuals) %>%
+  mutate(Model = "Booking\n(AUC ≈ 0.69)")
+
+df_live <- compute_surface(preds_live, actuals) %>%
+  mutate(Model = "Live Weather\n(AUC ≈ 0.79)")
+
+df_085 <- compute_surface(preds_085, actuals) %>%
+  mutate(Model = "Simulated\n(~0.85 AUC)")
+
+df_090 <- compute_surface(preds_090, actuals) %>%
+  mutate(Model = "Simulated\n(~0.90+ AUC)")
+
+plot_df <- bind_rows(df_booking, df_live, df_085, df_090)
+
+# Order factors
+plot_df$Risk <- factor(plot_df$Risk, levels = risk_labels)
+
+# ---------------------------------------------------------
+# DECISIONS
+# ---------------------------------------------------------
+plot_df <- plot_df %>%
+  mutate(
+    # Round for stability (matches what you display)
+    CancelRate_r = round(CancelRate, 1),
+    EV_r = round(EV, 1),
+    
+    Decision = case_when(
+      CancelRate_r > premium_pct ~ "BUY",
+      abs(CancelRate_r - premium_pct) <= 0.4 ~ "BREAK-EVEN",
+      TRUE ~ "SKIP"
+    ),
+    
+    EV_Decision = case_when(
+      abs(EV_r) <= 0.4 ~ "BREAK-EVEN",
+      EV_r > 0         ~ "BUY",
+      TRUE             ~ "SKIP"
+    )
+  )
+
+# ══════════════════════════════════════════════════════════════
+# PLOT 1 — CANCEL PROBABILITY
+# ══════════════════════════════════════════════════════════════
+
+ggplot(plot_df, aes(x = Model, y = Risk, fill = Decision)) +
+  
+  geom_tile(color = "white", linewidth = 0.5) +
+  
+  geom_text(aes(label = sprintf("%.1f%%", CancelRate)),
+            size = 3.5, fontface = "bold") +
+  
+  scale_fill_manual(
+    values = c(
+      "BUY" = "#2ecc71",
+      "BREAK-EVEN" = "#f39c12",
+      "SKIP" = "#e74c3c"
+    )
+  ) +
+  
+  labs(
+    title = "Cancellation Insurance Decisions by Model Quality",
+    subtitle = "Booking vs Live vs Simulated Models (Correct Percentile Mapping)",
+    x = "",
+    y = "Risk Tier"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+```
+The results show that incorporating real-time weather information (AUC ≈ 0.79) substantially improves the model’s ability to rank cancellation risk compared to the booking-time model (AUC ≈ 0.69). This improvement is clearly visible in the cancellation rate heatmap: under the live weather model, cancellation probabilities rise much more sharply as we move into higher-risk tiers. For example, while the booking model only reaches around 6.5% cancellation probability at the top 3% tier, the live model achieves this break-even level already at approximately the top 17%, indicating much stronger concentration of risk.
+
+This sharper separation means that the live weather model is significantly more effective at identifying high-risk flights earlier in the ranking. As a result, actionable insurance decisions can be made for a larger portion of flights. In contrast, the booking-time model exhibits a much flatter risk gradient, with cancellation rates increasing more slowly across tiers, limiting its ability to isolate truly high-risk observations. While it still provides some signal—particularly in the extreme top tiers—it is less useful for broader decision-making where finer risk differentiation is required.
+
+The simulated models further reinforce this pattern. As model quality improves (toward AUC ≈ 0.85 and ≈ 0.90+), the overall structure of the heatmap remains largely unchanged, but the concentration of risk in the highest tiers becomes increasingly pronounced. Cancellation rates in the top percentiles rise dramatically, while lower-risk tiers remain relatively stable. This indicates that better models do not fundamentally change which flights are considered high or low risk; instead, they sharpen the ranking by pushing truly risky flights further toward the top of the distribution.
+
+Importantly, the break-even threshold continues to shift upward in the ranking as model quality improves. With stronger models, fewer flights need to be classified as “high risk” to reach the same cancellation probability level, reflecting more precise identification of risk. This highlights that improvements in predictive performance primarily enhance how tightly risk is concentrated rather than redefining the underlying structure of risk itself.
+
+Overall, these findings suggest that while booking-time models provide a useful baseline and live weather models deliver substantial practical gains, further improvements mainly refine the ordering of already identified risk patterns. The key benefit of stronger models lies in their ability to more efficiently isolate the highest-risk flights, rather than in altering the fundamental decision landscape.
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════
+# PLOT 2 — EXPECTED VALUE
+# ══════════════════════════════════════════════════════════════
+
+ggplot(plot_df, aes(x = Model, y = Risk, fill = EV_Decision)) +
+  
+  geom_tile(color = "white", linewidth = 0.5) +
+  
+  geom_text(aes(label = sprintf("%+.1f", EV)),
+            size = 3.5, fontface = "bold") +
+  
+  scale_fill_manual(
+    values = c(
+      "BUY" = "#2ecc71",
+      "BREAK-EVEN" = "#f39c12",
+      "SKIP" = "#e74c3c"
+    )
+  ) +
+  
+  labs(
+    title = "Cancellation Insurance Expected Value by Model Quality",
+    subtitle = "Higher AUC increases value, but gains begin to flatten",
+    x = "",
+    y = "Risk Tier"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+```
+Building on the differences in cancellation rate distributions, the expected value heatmap reveals how improvements in model quality translate into economic gains. While the booking-time model struggles to generate positive expected value beyond the very highest risk tiers, the introduction of live weather data already leads to a meaningful shift: positive expected value emerges earlier in the ranking, around the top 10–17% of flights. This confirms that the improved risk concentration observed previously is not only statistically relevant but also economically actionable.
+
+As model quality increases further in the simulated scenarios, the structure of the decision regions remains broadly similar, but the magnitude of expected value grows substantially. Higher-AUC models significantly increase the expected value within the same high-risk tiers, with especially large gains in the top 5%, 2%, and 1% segments. This reflects the models’ ability to concentrate cancellation risk more precisely, raising the average cancellation probability within already identified high-risk groups.
+
+At the same time, a pattern of diminishing returns becomes visible. The transition from the booking model to the live weather model produces a clear shift in both the location and size of profitable regions. In contrast, further improvements from AUC ≈ 0.79 to ≈ 0.85 and ≈ 0.90+ primarily amplify expected value within those regions rather than expanding them significantly. In other words, better models do not drastically change which flights should be insured, but they make those decisions more profitable.
+
+This highlights an important distinction: while ranking improvements initially unlock new decision opportunities (moving flights into the profitable region), later improvements mainly enhance the intensity of those opportunities. From a practical perspective, this suggests that access to real-time weather data already captures most of the structural value for cancellation insurance decisions, while further model improvements are primarily beneficial for optimizing pricing, capital allocation, and profitability within the highest-risk segments.
+
+
+Insurance Side
+
+How traveler awarness effects profits under a constant price assuming rational behaviour, demonstrating how an application can effect the insurance market based on information avaliable at the time of purchasing insurance.
+
+This assumes that every aware traveler will only buy isnurance if their ev>0. This shows how profits go to 0 based on the amount of travelers that become aware compared to the full traveler population. The baseline profit, is the cancel rate for the full population 1.8, so 6.5% premimum - 1.8%.
+
+```{r} 
+# Plot 2 — Profit vs Awareness (Cancellation Insurance)
+
+
+
+alphas <- seq(0, 1, by = 0.1)
+
+compute_profit_by_awareness <- function(preds, actuals, break_even_pct) {
+  threshold <- quantile(preds, 1 - break_even_pct/100)
+  above_breakeven <- as.numeric(preds >= threshold)
+  
+  results <- list()
+  for (alpha in alphas) {
+    # (1-α) fraction buys randomly, α fraction only buys if above break-even
+    purchase_prob <- (1 - alpha) * 1 + alpha * above_breakeven
+    
+    weighted_cancel_rate <- sum(actuals * purchase_prob) / sum(purchase_prob)
+    profit <- 0.065 - weighted_cancel_rate
+    
+    results[[length(results) + 1]] <- tibble(alpha = alpha, profit = profit)
+  }
+  bind_rows(results)
+}
+
+profit_booking <- compute_profit_by_awareness(preds_booking, actuals, 3) %>%
+  mutate(model = "Booking (AUC ≈ 0.69)")
+
+profit_live <- compute_profit_by_awareness(preds_live, actuals, 17) %>%
+  mutate(model = "Live Weather (AUC ≈ 0.79)")
+
+
+profit_df <- bind_rows(profit_booking, profit_live)
+
+ggplot(profit_df, aes(x = alpha, y = profit, color = model)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("#3498db", "#e74c3c")) +
+  labs(
+    title = "Insurer Profit vs Consumer Awareness (Cancellation Insurance)",
+    x = "Awareness Parameter (α)",
+    y = "Expected Profit per Policy"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+---
+
+## 1. Why both lines converge to zero at α = 1
+
+At full awareness:
+
+* Every traveler evaluates expected value correctly.
+* They only buy if expected value is non-negative.
+
+Because you define the break-even threshold using the data:
+
+* The cutoff group has average cancellation risk ≈ price (6.5%).
+* Everyone above that threshold buys.
+* Everyone below does not.
+
+Now the key equilibrium:
+
+* The **marginal buyer** has EV = 0.
+* The **inframarginal buyers** (higher risk) have EV > 0.
+
+But when you average across all buyers:
+
+* The pool expands until the **average risk equals the price**.
+
+So:
+
+* Expected payout = premium
+* Profit = 0
+
+This holds for both models, regardless of AUC.
+
+**Interpretation:**
+
+> With full awareness, the market clears at the break-even condition, eliminating insurer profits.
+
+---
+
+## 2. Why the better model drops faster
+
+The only difference between the curves is:
+
+* Booking model: break-even at ~Top 3%
+* Live model: break-even at ~Top 17%
+
+As awareness increases:
+
+* A larger share of travelers switches from “random buying” (high-margin)
+  to “informed buying” (≈ zero-margin)
+
+Since the live model identifies a much larger group as above break-even:
+
+* More people move into the zero-profit segment
+* This happens earlier and faster
+
+**Interpretation:**
+
+> Better information accelerates the transition from profitable uninformed demand to break-even informed demand.
+
+---
+
+## 3. What your model assumes (and why it matters)
+
+Your current setup assumes:
+
+* If EV > 0 → buy with certainty
+* If EV ≤ 0 → do not buy
+
+So:
+
+* All informed buyers are treated the same
+* The average of that group is forced toward break-even
+
+This is why:
+
+* Profit smoothly declines to zero
+* It never becomes negative
+
+---
+
+## 4. What changes in reality
+
+In reality:
+
+* Purchase probability increases with EV
+* It is not a binary decision
+
+So:
+
+* EV slightly above 0 → low purchase probability
+* EV very high → high purchase probability
+
+This creates **selection within the informed group**:
+
+* Low EV buyers drop out
+* High EV buyers dominate
+
+---
+
+## 5. Why this leads to negative profits in reality
+
+Under this more realistic behavior:
+
+* The buyer pool is no longer centered at the break-even threshold
+* It becomes **skewed toward high-risk travelers**
+
+That means:
+
+* Average cancellation risk of buyers > price
+* Expected payouts > premiums
+
+So:
+
+> **Average profit becomes negative**
+
+---
+
+## 6. Why the better model worsens this effect
+
+The better model (live weather):
+
+* Concentrates risk more strongly at the top
+* Creates very high EV in top percentiles (e.g. +18%)
+
+With EV-sensitive demand:
+
+* These high-risk travelers are much more likely to buy
+* Low-risk travelers opt out
+
+So:
+
+* Selection becomes more extreme
+* The pool becomes more adverse
+
+**Result:**
+
+> The better the model, the stronger the adverse selection, and the more negative insurer profits can become under realistic behavior.
+
+---
+
+## 7. Final interpretation (paper-ready)
+
+> Both models converge to zero profit under full awareness because only travelers with non-negative expected value purchase insurance, implying that the average risk of the buyer pool equals the insurance price. However, this result relies on a binary purchase assumption. In practice, purchase probability likely increases with expected value, leading to disproportionate participation by high-risk travelers. This would skew the buyer pool above the break-even threshold, resulting in negative insurer profits. As predictive accuracy improves, this adverse selection effect becomes stronger, suggesting that better models may further reduce insurer profitability rather than simply driving it to zero.
+
+```{r}
+alphas <- seq(0, 1, by = 0.1)
+
+compute_profit_flat <- function(preds, actuals, break_even_pct, n_travelers = 1000) {
+  threshold <- quantile(preds, 1 - break_even_pct/100)
+  above_breakeven <- as.numeric(preds >= threshold)
+  
+  results <- list()
+  for (alpha in alphas) {
+    purchase_prob <- (1 - alpha) * 1 + alpha * above_breakeven
+    
+    weighted_cancel <- sum(actuals * purchase_prob) / sum(purchase_prob)
+    avg_profit <- 0.065 - weighted_cancel - 0.02
+    
+    n_policies <- sum(purchase_prob) / length(purchase_prob) * n_travelers
+    total_profit <- avg_profit * n_policies -10
+    
+    results[[length(results) + 1]] <- tibble(
+      alpha = alpha,
+      avg_profit = avg_profit,
+      total_profit = total_profit,
+      n_policies = n_policies
+    )
+  }
+  bind_rows(results)
+}
+
+df_booking <- compute_profit_flat(preds_booking, actuals, 3) %>%
+  mutate(model = "Booking (AUC ≈ 0.69)")
+
+df_live <- compute_profit_flat(preds_live, actuals, 17) %>%
+  mutate(model = "Live Weather (AUC ≈ 0.79)")
+
+plot_df <- bind_rows(df_booking, df_live)
+
+p1 <- ggplot(plot_df, aes(x = alpha, y = avg_profit, color = model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("#3498db", "#e74c3c")) +
+  labs(title = "Average Profit per Traveler", x = "Awareness (α)", y = "Avg Profit per Traveler", color = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p2 <- ggplot(plot_df, aes(x = alpha, y = total_profit, color = model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("#3498db", "#e74c3c")) +
+  labs(title = "Total Profit (1000 Travelers)", x = "Awareness (α)", y = "Total Profit", color = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+p3 <- ggplot(plot_df, aes(x = alpha, y = n_policies / 10, color = model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("#3498db", "#e74c3c")) +
+  labs(
+    title = "Market Participation Rate",
+    x = "Awareness (α)",
+    y = "Buyers (% of Travelers)",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+p1 / p2 
+```
+Here is a clean, paper-ready interpretation and conclusion that stays tightly aligned with what you actually show in the results.
+
+---
+```{r}
+p3 <- ggplot(plot_df, aes(x = alpha, y = n_policies / 10, color = model)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("#3498db", "#e74c3c")) +
+  labs(
+    title = "Market Participation Rate",
+    x = "Awareness (α)",
+    y = "Buyers (% of Travelers)",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+p3
+```
+
+## Interpretation and Conclusion
+
+The analysis demonstrates that the profitability of cancellation insurance is fundamentally shaped by the interaction between **consumer awareness** and **predictive information quality**. When consumers are uninformed, flat pricing can sustain positive margins because purchases are effectively random and include a broad cross-section of risk types. In this regime, insurers benefit from implicit cross-subsidization, where low-risk consumers offset losses from high-risk individuals.
+
+As consumer awareness increases, this mechanism breaks down. Consumers begin to condition their purchase decisions on expected value, leading higher-risk individuals to selectively buy insurance while lower-risk individuals opt out. This generates classic adverse selection. The results show that this process unfolds smoothly but inevitably: average profit per policy declines, and total profit collapses as participation falls. In the limit, when consumers are fully informed, only contracts with non-negative expected value are purchased, implying that insurer profits converge to zero.
+
+Average profit declines because, as awareness increases, a larger share of buyers comes from higher-risk groups. These individuals no longer generate losses, but they also contribute little or no profit, so the overall average is diluted as the pool shifts toward contracts with lower margins.
+
+Under risk aversion, consumers may purchase insurance even when expected value is negative, which sustains demand among lower-risk individuals and prevents full market unraveling. As a result, profits decline with awareness but do not converge to zero.
+
+A central finding is that **improvements in predictive accuracy accelerate this process**. More informative models allow consumers to better identify when insurance is favorable, sharpening the selection effect. This leads to a faster deterioration in the risk pool and earlier profit erosion. Importantly, while model quality affects the composition of buyers and the trajectory of per-policy margins, total profit declines at a similar rate across models. This indicates that the dominant channel through which awareness affects insurers is not only worsening risk composition, but also a reduction in participation.
+
+Taken together, the results imply that **flat, uniform pricing is not sustainable in environments where consumers have access to accurate, decision-relevant information**. As the gap between insurer information and consumer information narrows, the cross-subsidization that supports flat pricing disappears. This is not a marginal effect but a structural shift in the market equilibrium.
+
+---
+
+## Real-World Implications
+
+The findings point to a clear implication for real-world insurance markets:
+insurers cannot rely on static pricing when consumers are able to evaluate risk with increasing precision. In such environments, three broad outcomes emerge.
+
+First, insurers may transition toward **risk-based pricing**, where premiums reflect individual risk more closely. This eliminates adverse selection by aligning prices with expected losses, stabilizing the market. However, it also compresses margins, as the rents previously obtained from uninformed consumers disappear. Profitability then depends more on operational efficiency and competitive positioning than on informational asymmetries.
+
+Second, if pricing cannot fully adjust—due to regulatory, operational, or product constraints—markets may experience **partial unraveling**. Participation declines, particularly among low-risk consumers, leading to smaller and more volatile risk pools. This is consistent with the observed decline in total profit in the model and suggests that some insurance products may become economically unattractive or disappear entirely under high awareness.
+
+Third, in cases where risk-based pricing is limited and market failure is a concern, **risk pooling mechanisms** may emerge, either through product bundling or policy intervention. By broadening participation, these mechanisms can sustain coverage despite adverse selection, though typically at the cost of reduced pricing granularity.
+
+---
+
+## Overall Conclusion
+
+The core insight of the paper is that **consumer awareness and predictive information are not neutral improvements—they fundamentally reshape market outcomes**. As consumers become better able to evaluate expected value, the economic foundation of cross-subsidized insurance weakens. This forces a transition toward pricing structures that more closely reflect individual risk.
+
+In this sense, advances in data and information do not simply improve decision-making; they **change the equilibrium of insurance markets**, shifting them from high-margin, pooled systems toward lower-margin, information-efficient ones.
+
+
+
+### Final Takeaway
+
+This framework transforms flight cancellation prediction from a binary classification problem into a personalized economic advisor that:
+
+- Recommends insurance when EV is positive (top 3%)
+- Provides break-even pricing when EV is negative (bottom 97%)
+- Shows transparent calculations (expected loss, insurance cost, net value)
+
+**Key Innovation:** By showing break-even prices for lower-risk flights, the system helps customers make informed insurance decisions even when NOT recommending the airline's own product. This transparency builds trust and differentiates the airline as customer-focused rather than purely profit-driven.
+
+The top 3% threshold (precision 6.50%) provides a mathematically precise boundary where stand
