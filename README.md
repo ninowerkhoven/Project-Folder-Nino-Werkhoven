@@ -14,11 +14,11 @@ Contact: ninowerkhoven@gmail.com
 
 ## Flight Delay Analysis & Prediction
 
-Data Science Lab project analysing flight and weather data for approximately 635,000 US domestic flights (2010–2019). The project combines SQL-based data analysis, Power BI visualisation and machine learning to investigate flight delays and cancellations and explore their financial impact on travel insurance.
+- Data Science Lab project analysing flight and weather data for approximately 635,000 US domestic flights (2010–2019). The project combines SQL-based data analysis, Power BI visualisation and machine learning to investigate flight delays and cancellations and explore their financial impact on travel insurance.
 
-01_SQL_PowerBI_Analysis: SQL analysis of flight performance, delays and cancellations using aggregations, CTEs and views. Includes an interactive Power BI dashboard exploring patterns by airline, airport, month and departure time.
+- 01_SQL_PowerBI_Analysis: SQL analysis of flight performance, delays and cancellations using aggregations, CTEs and views. Includes an interactive Power BI dashboard exploring patterns by airline, airport, month and departure time.
 
-02_Machine_Learning_Insurance: XGBoost models to predict flight delays and cancellations, with model performance evaluation. Predictions are translated into expected financial outcomes and break-even insurance premiums. Includes an interactive R Shiny app that provides personalised advice, estimates a fair insurance premium and explains key risk factors using SHAP values.
+- 02_Machine_Learning_Insurance: XGBoost models to predict flight delays and cancellations, with model performance evaluation. Predictions are translated into expected financial outcomes and break-even insurance premiums. Includes an interactive R Shiny app that provides personalised advice, estimates a fair insurance premium and explains key risk factors using SHAP values.
 
 ## Predicting Employment Loss (Bachelor Thesis)
 
